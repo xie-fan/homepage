@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>Homepage</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/style.css">
   <script type="module" src="/app.js"></script>
   <script type="module" src="/dnd.js"></script>
@@ -30,7 +31,7 @@
   </main>
 
   <div id="modal-bookmark" class="modal-backdrop" hidden>
-    <form id="form-bookmark" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-bookmark-title">
+    <form id="form-bookmark" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-bookmark-title" novalidate>
       <h2 id="modal-bookmark-title">添加书签</h2>
       <label class="field">
         <span>名称</span>
@@ -46,7 +47,7 @@
         <button id="bm-refresh" class="btn" type="button" hidden>刷新图标</button>
         <span class="spacer"></span>
         <button id="bm-cancel" class="btn" type="button">取消</button>
-        <button class="btn btn-primary" type="submit">保存</button>
+        <button id="bm-submit" class="btn btn-primary" type="submit">保存</button>
       </div>
     </form>
   </div>

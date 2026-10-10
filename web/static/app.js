@@ -33,8 +33,35 @@ const TILE_DRAG_SLOP = 6; // px of movement (mouse on tile) that starts a drag
 const TILE_HOLD_MS = 350; // touch/pen hold on a tile that starts a drag
 const HOLD_SLOP = 10; // px of wandering that forfeits a pending touch hold
 
-const POLL_INTERVAL = 1500; // ms between bookmark re-fetches
-const POLL_TRIES = 8; // give up after ~12s of pending icons
+// Icon polling: a favicon fetch can take ~24s, so re-fetch bookmarks at
+// 1.5s for a while, back off to 3s, and give up after ~40s total.
+const POLL_INTERVAL = 1500; // initial ms between bookmark re-fetches
+const POLL_INTERVAL_SLOW = 3000; // backed-off interval
+const POLL_SLOW_AFTER = 15000; // switch to the slow interval past this
+const POLL_BUDGET = 40000; // stop polling pending icons after ~40s
+
+// API error codes → Chinese messages shown in dialogs and toasts.
+const ERROR_MESSAGES = {
+  url_required: '请输入网址',
+  url_invalid: '网址格式不正确',
+  url_scheme: '只支持 http/https 网址',
+  url_too_long: '网址太长（最多 2048 个字符）',
+  url_userinfo: '网址中不能包含用户名或密码',
+  title_too_long: '名称太长（最多 200 个字符）',
+  duplicate_url: '该网址已存在',
+  invalid_grid: '网格设置无效',
+  import_invalid: '导入文件格式不正确',
+  import_too_large: '导入的书签太多（最多 5000 个）',
+  not_found: '书签不存在，可能已被删除',
+  invalid_order: '排序失败，请刷新后重试',
+  internal: '服务器出错了，请稍后重试',
+  network: '网络错误，请检查连接',
+};
+
+// friendlyError maps an api.js error (err.code) to a Chinese message.
+function friendlyError(err) {
+  return ERROR_MESSAGES[err && err.code] || '操作失败';
+}
 
 // Mid-tone palette for letter avatars; readable white text on both themes.
 const AVATAR_COLORS = [
@@ -189,14 +216,33 @@ function makeTile(b) {
   return tile;
 }
 
+// iconURL builds the icon URL with a cache-buster that changes whenever
+// the icon file or the bookmark changes, so a re-render after an icon
+// fetch never serves the stale (or previously failed) response.
+function iconURL(b) {
+  const v = `${b.icon_path}|${b.updated_at}`;
+  return `/api/icons/${b.id}?v=${encodeURIComponent(v)}`;
+}
+
 function makeIcon(b) {
   const box = el('div', 'tile-icon');
   if (b.icon_status === 'ok') {
     const img = new Image();
-    img.src = `/api/icons/${b.id}?v=${encodeURIComponent(b.updated_at)}`;
     img.alt = '';
     img.draggable = false;
-    img.addEventListener('error', () => box.replaceChildren(avatar(b)), { once: true });
+    let attempt = 0;
+    img.addEventListener('error', () => {
+      // The status flips to "ok" as soon as the fetch worker stores the
+      // file, but a load can still race the write or a stale cache — retry
+      // twice with a fresh URL before falling back to the letter avatar.
+      if (attempt < 2) {
+        attempt += 1;
+        setTimeout(() => { img.src = `${iconURL(b)}&r=${attempt}`; }, 1200);
+      } else {
+        box.replaceChildren(avatar(b));
+      }
+    });
+    img.src = iconURL(b);
     box.append(img);
   } else {
     box.append(avatar(b));
@@ -494,12 +540,24 @@ function showToast(text) {
 
 // ---------- bookmark modal ----------
 
+// Set when the server answered 409 duplicate_url: the next submit resends
+// the same values with allow_duplicate, and the primary button says so.
+let allowDuplicate = false;
+
+// resetDuplicate clears the "add anyway" state — on open and whenever a
+// field is edited, the dialog goes back to a normal save.
+function resetDuplicate() {
+  allowDuplicate = false;
+  els.bmSubmit.textContent = '保存';
+}
+
 function openBookmarkModal(b) {
   state.editing = b;
   els.modalBookmarkTitle.textContent = b ? '编辑书签' : '添加书签';
   els.bmTitle.value = b ? b.title : '';
   els.bmUrl.value = b ? b.url : '';
   hideMsg(els.bmError);
+  resetDuplicate();
   els.bmDelete.hidden = !b;
   els.bmRefresh.hidden = !b;
   showModal(els.modalBookmark);
@@ -509,18 +567,37 @@ async function onBookmarkSubmit(e) {
   e.preventDefault();
   const title = els.bmTitle.value.trim();
   let url = els.bmUrl.value.trim();
-  if (url && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url)) url = `https://${url}`;
+  if (!url) {
+    // The form uses novalidate: requiredness is enforced here so the hint
+    // shows inline instead of the browser's native tooltip.
+    showMsg(els.bmError, '请输入网址', true);
+    els.bmUrl.focus();
+    return;
+  }
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url)) url = `https://${url}`;
   try {
     if (state.editing) {
-      await api.updateBookmark(state.editing.id, title, url);
+      await api.updateBookmark(state.editing.id, title, url, allowDuplicate);
     } else {
-      await api.createBookmark(title, url);
+      await api.createBookmark(title, url, allowDuplicate);
     }
     closeModal();
     await refresh();
     pollIcons();
   } catch (err) {
-    showMsg(els.bmError, err.message, true);
+    if (err.code === 'duplicate_url') {
+      // Offer the explicit override: relabel the primary button and let
+      // the next submit resend with allow_duplicate. Editing a field
+      // resets this (see the input listeners in bindEvents).
+      allowDuplicate = true;
+      els.bmSubmit.textContent = state.editing ? '仍然保存' : '仍然添加';
+      const existing = state.bookmarks.find(
+        (x) => x.id === (err.data && err.data.existing_id));
+      showMsg(els.bmError,
+        existing ? `该网址已存在（${existing.title}）` : '该网址已存在', true);
+      return;
+    }
+    showMsg(els.bmError, friendlyError(err), true);
   }
 }
 
@@ -532,7 +609,7 @@ async function onDeleteClick() {
     closeModal();
     await refresh();
   } catch (err) {
-    showMsg(els.bmError, err.message, true);
+    showMsg(els.bmError, friendlyError(err), true);
   }
 }
 
@@ -546,7 +623,7 @@ async function onRefreshIconClick() {
     render();
     pollIcons();
   } catch (err) {
-    showMsg(els.bmError, err.message, true);
+    showMsg(els.bmError, friendlyError(err), true);
   }
 }
 
@@ -567,7 +644,7 @@ async function onGridChange() {
     state.grid = saved.grid;
     render(); // re-chunk pages under the new grid
   } catch (err) {
-    showMsg(els.setMsg, err.message, true);
+    showMsg(els.setMsg, friendlyError(err), true);
   }
 }
 
@@ -599,7 +676,7 @@ async function onImportClick() {
     await refresh();
     pollIcons();
   } catch (err) {
-    showMsg(els.setMsg, err.message, true);
+    showMsg(els.setMsg, friendlyError(err), true);
   }
 }
 
@@ -614,29 +691,37 @@ async function refresh() {
 }
 
 // pollIcons re-fetches bookmarks while icons are still pending so tiles
-// pick up fetched favicons without a manual reload.
+// pick up fetched favicons without a manual reload. Restarted after
+// add/edit/refresh/import; a fetch can take ~24s, so the budget is ~40s:
+// 1.5s ticks early, backing off to 3s once the wait gets long.
 let pollTimer = 0;
+let pollStart = 0;
 function pollIcons() {
   clearTimeout(pollTimer);
-  let tries = 0;
-  const tick = async () => {
-    tries++;
-    // A running tile drag owns the list order; don't clobber it mid-gesture.
-    if (tileDnd && tileDnd.active()) {
-      if (tries < POLL_TRIES) pollTimer = setTimeout(tick, POLL_INTERVAL);
-      return;
-    }
-    try {
-      state.bookmarks = await api.listBookmarks();
-      render();
-    } catch {
-      // Transient poll failure: the next scheduled tick retries.
-    }
-    if (tries < POLL_TRIES && state.bookmarks.some((b) => b.icon_status === 'pending')) {
-      pollTimer = setTimeout(tick, POLL_INTERVAL);
-    }
-  };
-  pollTimer = setTimeout(tick, POLL_INTERVAL);
+  pollStart = Date.now();
+  pollTimer = setTimeout(pollTick, POLL_INTERVAL);
+}
+
+function schedulePoll() {
+  const elapsed = Date.now() - pollStart;
+  if (elapsed >= POLL_BUDGET) return;
+  const delay = elapsed < POLL_SLOW_AFTER ? POLL_INTERVAL : POLL_INTERVAL_SLOW;
+  pollTimer = setTimeout(pollTick, Math.min(delay, pollStart + POLL_BUDGET - Date.now()));
+}
+
+async function pollTick() {
+  // A running tile drag owns the list order; don't clobber it mid-gesture.
+  if (tileDnd && tileDnd.active()) {
+    schedulePoll();
+    return;
+  }
+  try {
+    state.bookmarks = await api.listBookmarks();
+    render();
+  } catch {
+    // Transient poll failure: the next scheduled tick retries.
+  }
+  if (state.bookmarks.some((b) => b.icon_status === 'pending')) schedulePoll();
 }
 
 // ---------- tile drag & drop (dnd.js) ----------
@@ -655,7 +740,7 @@ export async function persistOrder(ids) {
   render();
 }
 
-export { state, pageSize, render, goToPage, refresh, showToast };
+export { state, pageSize, render, goToPage, refresh, showToast, friendlyError };
 
 // ---------- events & boot ----------
 
@@ -680,6 +765,10 @@ function bindEvents() {
   document.addEventListener('click', onClickCapture, true);
 
   els.formBookmark.addEventListener('submit', onBookmarkSubmit);
+  // Editing either field drops the "add anyway" state (and its button
+  // label) so a stale duplicate answer can't be submitted by accident.
+  els.bmTitle.addEventListener('input', resetDuplicate);
+  els.bmUrl.addEventListener('input', resetDuplicate);
   els.bmCancel.addEventListener('click', closeModal);
   els.bmDelete.addEventListener('click', onDeleteClick);
   els.bmRefresh.addEventListener('click', onRefreshIconClick);
@@ -702,7 +791,7 @@ async function init() {
   for (const id of [
     'track', 'viewport', 'dots', 'nav-prev', 'nav-next', 'btn-add', 'btn-settings',
     'modal-bookmark', 'modal-bookmark-title', 'form-bookmark', 'bm-title', 'bm-url',
-    'bm-error', 'bm-delete', 'bm-refresh', 'bm-cancel',
+    'bm-error', 'bm-delete', 'bm-refresh', 'bm-cancel', 'bm-submit',
     'modal-settings', 'set-rows', 'set-cols', 'set-msg',
     'btn-export', 'btn-import', 'import-file', 'set-close', 'toast',
   ]) {
@@ -712,8 +801,11 @@ async function init() {
   restorePage();
   try {
     await refresh();
+    // Icons can already be pending at load (fresh import, previous
+    // session closed mid-fetch): start polling right away.
+    if (state.bookmarks.some((b) => b.icon_status === 'pending')) pollIcons();
   } catch (err) {
-    state.loadError = err.message;
+    state.loadError = friendlyError(err);
     render();
   }
 }

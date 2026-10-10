@@ -318,6 +318,40 @@ body.dnd-active * {
   cursor: grabbing !important;
 }
 
+/* While a drag dwells in an edge zone, a soft gradient marks the side
+   that is about to flip pages (dnd.js toggles the body classes). */
+.viewport::before,
+.viewport::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 4; /* above tiles, below the nav arrows (z-index 5) */
+  width: max(56px, 8%); /* mirrors edgeZonePx() in dnd.js */
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.viewport::before {
+  left: 0;
+  background: linear-gradient(to right, rgba(79, 109, 245, 0.18), transparent);
+  background: linear-gradient(to right,
+    color-mix(in srgb, var(--accent) 18%, transparent), transparent);
+}
+
+.viewport::after {
+  right: 0;
+  background: linear-gradient(to left, rgba(79, 109, 245, 0.18), transparent);
+  background: linear-gradient(to left,
+    color-mix(in srgb, var(--accent) 18%, transparent), transparent);
+}
+
+body.dnd-edge-left .viewport::before,
+body.dnd-edge-right .viewport::after {
+  opacity: 1;
+}
+
 /* ---------- arrows & dots ---------- */
 
 /* The pager row sits below the viewport: ‹  • • •  ›. On narrow screens

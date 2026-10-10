@@ -12,13 +12,16 @@
 // handlers registered at the bottom. index.html loads both modules.
 
 import {
-  state, pageSize, render, goToPage, refresh, showToast,
+  state, pageSize, render, goToPage, refresh, showToast, friendlyError,
   persistOrder, registerTileDnd,
 } from './app.js';
 
-const EDGE_PX = 40; // pointer this close to a viewport side flips pages
-const EDGE_DELAY_MS = 600; // hover time per edge flip (repeats while held)
+const EDGE_DWELL_MS = 700; // dwell time per edge flip (repeats while held)
 const CLONE_SCALE = 1.05; // slight zoom on the floating clone
+
+// Edge zone width: the wider of 56px and 8% of the viewport element's
+// width, so the flip target stays reachable on wide screens.
+const edgeZonePx = () => Math.max(56, viewport.clientWidth * 0.08);
 
 const viewport = document.getElementById('viewport');
 const track = document.getElementById('track');
@@ -77,7 +80,7 @@ async function drop() {
       state.bookmarks = original;
       render();
     }
-    showToast(`顺序保存失败：${err.message}`);
+    showToast(friendlyError(err));
   }
 }
 
@@ -174,11 +177,16 @@ function cellCoord(p, origin, cell, gap, n) {
 }
 
 // ---------- edge page flips ----------
+//
+// Parking the pointer inside an edge zone flips pages on a dwell timer:
+// entering the zone arms it, each flip re-arms it, and leaving the zone
+// cancels — no pointer movement is needed once it's parked.
 
 function edgeDirAt(x, y) {
   const r = viewport.getBoundingClientRect();
-  if (x - r.left < EDGE_PX) return -1;
-  if (r.right - x < EDGE_PX) return 1;
+  const zone = edgeZonePx();
+  if (x - r.left < zone) return -1;
+  if (r.right - x < zone) return 1;
   // The arrow buttons sit inside the edge zone on wide layouts but extend
   // past it; hovering one counts as hovering the edge.
   const hit = document.elementFromPoint(x, y);
@@ -187,25 +195,31 @@ function edgeDirAt(x, y) {
   return 0;
 }
 
+// setEdgeHint marks the occupied edge zone so style.css can highlight it.
+function setEdgeHint(dir) {
+  document.body.classList.toggle('dnd-edge-left', dir === -1);
+  document.body.classList.toggle('dnd-edge-right', dir === 1);
+}
+
 function updateEdge(x, y) {
   const dir = edgeDirAt(x, y);
   if (dir === dnd.edgeDir) return;
   dnd.edgeDir = dir;
+  setEdgeHint(dir);
   clearTimeout(dnd.edgeTimer);
-  if (dir !== 0) dnd.edgeTimer = setTimeout(() => edgeFlip(dir), EDGE_DELAY_MS);
+  if (dir !== 0) dnd.edgeTimer = setTimeout(() => edgeFlip(dir), EDGE_DWELL_MS);
 }
 
 function edgeFlip(dir) {
   if (!dnd || dnd.edgeDir !== dir) return;
   const before = state.page;
   goToPage(before + dir); // clamps at both ends, incl. the extra drag page
-  if (state.page === before) {
-    dnd.edgeDir = 0; // at the bound — only a fresh hover re-arms the flip
-    return;
-  }
+  // At the bound nothing flips; the timer stays disarmed until the
+  // pointer leaves and re-enters the zone (edgeDir keeps the direction).
+  if (state.page === before) return;
   updateTarget(dnd.x, dnd.y); // the page under the pointer just changed
   // Keep flipping while the pointer stays parked in the edge zone.
-  dnd.edgeTimer = setTimeout(() => edgeFlip(dir), EDGE_DELAY_MS);
+  dnd.edgeTimer = setTimeout(() => edgeFlip(dir), EDGE_DWELL_MS);
 }
 
 // ---------- cleanup & registration ----------
@@ -214,7 +228,7 @@ function cleanup() {
   clearTimeout(dnd.edgeTimer);
   dnd.clone?.remove();
   dnd = null;
-  document.body.classList.remove('dnd-active');
+  document.body.classList.remove('dnd-active', 'dnd-edge-left', 'dnd-edge-right');
   render(); // clears the placeholder marking and the extra drag page
 }
 
