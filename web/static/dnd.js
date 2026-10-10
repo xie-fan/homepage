@@ -1,38 +1,56 @@
-// dnd.js — pointer-based drag & drop reordering of tiles (Task 7).
+// dnd.js — pointer-based drag & drop across independent pages (Round 8).
 //
 // app.js owns gesture arbitration: a press on a tile becomes a tile drag
-// after >6px of pointer movement (mouse) or a 350ms hold (touch/pen) — see
-// onPointerDown there for the full swipe-vs-drag rule. Once arbitration
-// calls begin() this module owns the gesture: a floating clone follows the
-// pointer, the dragged item's grid slot renders as a dashed placeholder,
-// the bookmark list is reordered live, and hovering a viewport edge flips
-// pages. drop() persists the order; cancel() reverts it.
+// after >6px of pointer movement (mouse) or a 350ms hold (touch/pen) —
+// see onPointerDown there for the full swipe-vs-drag rule. Once
+// arbitration calls begin() this module owns the gesture: a floating
+// clone follows the pointer and the dragged item's grid slot renders as
+// a dashed placeholder.
 //
-// While a drag runs, thumbs.js mounts a strip of page thumbnails above
-// the pager: parking on one dwells toward a page flip (a thumb under the
-// pointer disarms both the in-grid reorder and the edge zones), and
-// releasing on one lands the item at the end of that page.
+// Pages are independent: every bookmark carries page + position, and the
+// committed order is a LAYOUT (ids per page — layout.js, the client
+// mirror of the server's algorithm). At drag start we snapshot the
+// committed layout L0 and never touch state.bookmarks afterwards: every
+// hover recomputes preview = insert(L0, id, page, index, cap) FROM THE
+// SNAPSHOT (never cumulative) and app.js renders that preview in place
+// of the real pages. Esc, or a release outside every valid target, just
+// drops the preview — the committed layout was never modified.
 //
-// Valid drop targets — releasing anywhere else cancels the move like Esc:
-//   1. the cell grid of the CURRENT page, padded by half the inter-cell
-//      gap on each side (min 12px) — see overGrid();
-//   2. the page thumbnails — see thumbs.dropPage().
-// A release on the page gutters, the edge-flip zones, the header, the
-// pager, below the grid or outside the window restores the pre-drag
-// order and persists nothing. The live reorder preview keeps tracking
-// the pointer wherever it roams; the revert happens at drop time.
+// Hover → index rules (an index counts slots AFTER removing the dragged
+// id, exactly like insert() applies it):
+//   • over a tile at slot i        → index i
+//   • over an empty slot on page p → index len(L0[p] without the dragged
+//     id); unified with the tile rule as index = min(cell, that length)
+//   • the dashed "+ 新页" page      → a new last page: page = len(L0)
+//   • a page thumbnail             → index 1e9 (the server clamps it to
+//     the end of the page; the preview does the same)
+//   • anywhere outside the current page's padded grid and the thumbnails
+//     → preview = L0, so what you see is what a cancel restores
+//
+// A DISPLAYED page index can differ from its L0 index in exactly one
+// case: the dragged item was the only bookmark on its L0 page and the
+// preview moved it off — the emptied page no longer exists and later
+// displayed pages sit one lower. mapPage() translates displayed → L0.
+//
+// A drop POSTs /api/bookmarks/move {id,page,index} with the same values
+// the current preview used and adopts the returned list — the server is
+// the source of truth. While a drag runs, thumbs.js mounts a strip of
+// page thumbnails above the pager; edge-dwell page flips and thumbnail
+// dwell switching work like before.
 //
 // Imports are one-way — app.js never imports this file; it calls the
 // handlers registered at the bottom. index.html loads both modules.
 
 import {
-  state, pageSize, render, goToPage, refresh, showToast, friendlyError,
-  persistOrder, registerTileDnd,
+  state, pageSize, render, goToPage, showToast, friendlyError,
+  commitMove, registerTileDnd,
 } from './app.js';
+import { insert, toLayout } from './layout.js';
 import * as thumbs from './thumbs.js';
 
 const EDGE_DWELL_MS = 700; // dwell time per edge flip (repeats while held)
 const CLONE_SCALE = 1.05; // slight zoom on the floating clone
+const DROP_END = 1e9;     // index meaning "the end of the page" (clamped)
 
 // Edge zone width: the wider of 56px and 8% of the viewport element's
 // width, so the flip target stays reachable on wide screens.
@@ -41,12 +59,14 @@ const edgeZonePx = () => Math.max(56, viewport.clientWidth * 0.08);
 const viewport = document.getElementById('viewport');
 const track = document.getElementById('track');
 
-// Active drag, or null. `original` is a snapshot of the bookmark array taken
-// at drag start (order is what matters — items are shared, never mutated) and
-// `page` the page it started on — both restored by cancel(). offX/offY is the
-// grab point inside the tile so the clone keeps that offset while following
-// the pointer.
-let dnd = null; // {id, original, page, clone, offX, offY, x, y, edgeDir, edgeTimer}
+// Active drag, or null. `L0` is the committed layout snapshot taken at
+// drag start, `preview` the layout the grid currently renders, and
+// `target` the {page,index} — in L0 coordinates — that produced it, i.e.
+// exactly what a drop POSTs. `page` is the view at drag start (cancel
+// restores it), `srcPage` the dragged id's L0 page. offX/offY is the
+// grab point inside the tile so the clone keeps that offset while
+// following the pointer.
+let dnd = null; // {id, L0, preview, target, page, srcPage, clone, offX, offY, x, y, edgeDir, edgeTimer}
 
 // Viewport point of the latest primary pointerup. pointermove events
 // coalesce, so on a fast release the last move dnd.js processed can lag
@@ -59,16 +79,59 @@ window.addEventListener('pointerup', (e) => {
   if (e.isPrimary) lastUp = { x: e.clientX, y: e.clientY, t: performance.now() };
 }, true);
 
+// ---------- helpers ----------
+
+function sameLayout(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const pa = a[i];
+    const pb = b[i];
+    if (pa.length !== pb.length) return false;
+    for (let j = 0; j < pa.length; j++) if (pa[j] !== pb[j]) return false;
+  }
+  return true;
+}
+
+// mapPage translates a DISPLAYED page index (an index into the live
+// preview — the page the pointer is over) into the L0 page index that
+// insert() and the move endpoint expect. They differ only when the
+// dragged bookmark was the sole item of its L0 page and the preview
+// moved it off: that page no longer exists and displayed pages after it
+// sit one lower. The "+ 新页" targets — index len(preview) — land on
+// len(L0), the "new page" the server understands; anything past the end
+// clamps there too.
+function mapPage(i) {
+  const shifted = dnd.preview.length < dnd.L0.length;
+  const p = shifted && i >= dnd.srcPage ? i + 1 : i;
+  return Math.min(Math.max(p, 0), dnd.L0.length);
+}
+
+// setPreview swaps in a freshly computed preview layout and the target
+// that produced it, re-rendering only when the layout actually changed —
+// the grid, dots and thumbnails all follow it.
+function setPreview(L, target) {
+  dnd.target = target;
+  if (sameLayout(L, dnd.preview)) return;
+  dnd.preview = L;
+  render();        // pages render from the preview via displayPages()
+  thumbs.update(); // the mini pages mirror the preview too
+}
+
 // ---------- handlers called by app.js ----------
 
 function begin(x, y, bm) {
   if (dnd) return;
   const src = track.querySelector(`.tile[data-id="${bm.id}"]`);
   if (!src) return; // tile vanished between pointerdown and drag start
+  const L0 = toLayout(state.bookmarks);
+  const srcPage = Math.max(0, L0.findIndex((p) => p.includes(bm.id)));
   dnd = {
     id: bm.id,
-    original: state.bookmarks.slice(),
+    L0,
+    preview: L0,
+    target: null,
     page: state.page,
+    srcPage,
     x, y,
     offX: 0, offY: 0,
     edgeDir: 0, edgeTimer: 0,
@@ -86,11 +149,16 @@ function move(x, y) {
   dnd.x = x;
   dnd.y = y;
   positionClone(x, y);
-  // A page thumbnail under the pointer owns it: the grid reorder stays
-  // put (hovering must not scramble the order) and the edge zones are
-  // disarmed — the strip wins over both until the pointer moves off it.
-  if (thumbs.move(x, y) !== null) {
+  // A page thumbnail under the pointer owns it: the preview shows the
+  // item appended to that page (index 1e9 — the very value a drop
+  // sends; insert() clamps it to the end just like the server does)
+  // and the edge zones are disarmed until the pointer moves off.
+  const tp = thumbs.move(x, y);
+  if (tp !== null) {
     setEdge(0);
+    const p = mapPage(tp);
+    setPreview(insert(dnd.L0, dnd.id, p, DROP_END, pageSize()),
+      { page: p, index: DROP_END });
     return;
   }
   updateEdge(x, y);
@@ -99,51 +167,48 @@ function move(x, y) {
 
 async function drop() {
   if (!dnd) return;
-  const { original } = dnd;
-  // Commit at the real release point (see lastUp above); fall back to the
-  // last processed move only if no fresh pointerup was seen.
+  // Commit at the real release point (see lastUp above); fall back to
+  // the last processed move only if no fresh pointerup was seen.
   const up = lastUp && performance.now() - lastUp.t < 250 ? lastUp : dnd;
   const x = up.x;
   const y = up.y;
-  // A release on a page thumbnail moves the item to the END of that page
-  // (the strip is still mounted here — cleanup() hides it below). A
-  // release over the current page's grid commits through updateTarget —
-  // the same code path as the live preview, so the persisted index is
-  // exactly the one the placeholder showed at this point. A release
-  // anywhere else cancels the drag like Esc.
-  const page = thumbs.dropPage(x, y);
-  if (page !== null) {
-    moveToPageEnd(page);
-    goToPage(page); // land the view where the drop went (clamps itself)
+  // A release on a page thumbnail moves the item to the END of that
+  // page (the strip is still mounted here — cleanup() hides it below).
+  // A release over the current page's grid commits the same {page,index}
+  // the live preview just used, so what the placeholder showed is what
+  // persists. A release anywhere else cancels the drag like Esc.
+  let target = null;
+  const tp = thumbs.dropPage(x, y);
+  if (tp !== null) {
+    const p = mapPage(tp);
+    target = { page: p, index: DROP_END };
+    setPreview(insert(dnd.L0, dnd.id, p, DROP_END, pageSize()), target);
+    goToPage(tp); // land the view where the drop went (clamps itself)
   } else if (overGrid(x, y)) {
-    updateTarget(x, y);
+    updateTarget(x, y); // recompute at the real release point
+    target = dnd.target;
   } else {
     cancel(); // outside every valid target: revert, re-render, no save
     return;
   }
-  const changed = state.bookmarks.some((b, i) => b.id !== original[i].id);
+  const unchanged = target === null || sameLayout(dnd.preview, dnd.L0);
+  const id = dnd.id;
   cleanup();
-  if (!changed) return; // landed back where it started: nothing to save
+  if (unchanged) return; // landed back where it started: nothing to save
   try {
-    await persistOrder(state.bookmarks.map((b) => b.id));
+    await commitMove(id, target.page, target.index);
   } catch (err) {
-    // The server is the source of truth: refetch the stored order. If even
-    // that fails, put the pre-drag order back so the UI is not left lying.
-    try {
-      await refresh();
-    } catch {
-      state.bookmarks = original;
-      render();
-    }
+    // state.bookmarks still holds the committed layout (it was never
+    // mutated) — re-render shows L0 again, i.e. the revert.
+    render();
     showToast(friendlyError(err));
   }
 }
 
 function cancel() {
   if (!dnd) return;
-  state.bookmarks = dnd.original; // drop the live-reordered array entirely
-  state.page = dnd.page;          // and go back to the page it started on
-  cleanup();
+  state.page = dnd.page; // go back to the page the drag started on
+  cleanup();             // drops the preview — render() shows L0 again
 }
 
 // ---------- clone ----------
@@ -179,103 +244,42 @@ function positionClone(x, y) {
     `translate(${x - dnd.offX}px, ${y - dnd.offY}px) scale(${CLONE_SCALE})`;
 }
 
-// ---------- live reorder ----------
+// ---------- live preview ----------
 
-// landingIndex maps a hovered slot to the flat list index the dragged
-// item A takes on the current page — ONE rule shared by the live preview
-// (updateTarget) and the drop commit in drop(), so what the placeholder
-// previews is exactly what persists. The order is a flat list and pages
-// are fixed-size slices of it, so when A moves forward across a page
-// boundary something must flow back the other way — that is inherent,
-// and the move stays a plain one: A is the only bookmark ever moved.
-// L' below means the bookmark list without A (entries past A's vacated
-// slot sit one step lower); `i` is the hovered cell's flat index in the
-// live list:
-//   • over a tile T → A lands immediately BEFORE T: to = indexOf(T in
-//     L'), clamped up to pageStart. The clamp only bites on the FIRST
-//     tile of a later page: A still sits upstream of it, so T's index
-//     in L' is pageStart − 1 and an unclamped insert would park A at
-//     the previous page's tail — "the drop didn't go onto this page".
-//     With to = pageStart, A becomes the hovered page's first tile and
-//     T keeps its index — i.e. flows back to the previous page's last
-//     slot (acceptable, inherent to fixed-size slices);
-//   • over an empty cell past the page's last tile (i ≥ length) → A
-//     goes to the end of that page's run: min(pageStart + perPage,
-//     length − 1) — the list end on the last page.
-// Examples (perPage = 24):
-//   [A,B,C,D,E,F], A over E → [B,C,D,A,E,F]:  k = 3, to = 3 (A at 3).
-//   [A,B,C,D,E,F], F over B → [A,F,B,C,D,E]:  k = 1, to = 1 (F at 1).
-//   n = 27, A at index 2, over page 2's first tile (i = 24):
-//     k = 23 < pageStart → to = 24 → A at 24, T stays at 23 (page 1's
-//     last slot). Over page 2's second tile (i = 25): k = 24 → to = 24
-//     → A at 24, that tile at 25.
-// Returns {to}: A's landing index in the reordered list.
-function landingIndex(list, dragId, pageStart, perPage, i) {
-  const from = list.findIndex((b) => b.id === dragId);
-  if (i === from) return { to: from };
-  if (i < list.length) {
-    const k = from >= 0 && i > from ? i - 1 : i; // hovered tile's index in L'
-    return { to: Math.max(pageStart, k) };
-  }
-  return { to: Math.min(pageStart + perPage, list.length - 1) };
-}
-
-// applyLanding performs the computed move as a plain splice — take A
-// out, insert it at t.to, and never move any other bookmark. When the
-// pageStart clamp put `to` past the hovered tile's index in L', that
-// tile keeps its slot and so lands on the previous page's tail: the
-// flat list flows back across the page boundary by itself. Returns
-// false when no move is needed.
-function applyLanding(list, dragId, t) {
-  const from = list.findIndex((b) => b.id === dragId);
-  if (from < 0 || from === t.to) return false;
-  const [bm] = list.splice(from, 1);
-  list.splice(t.to, 0, bm);
-  return true;
-}
-
-// insertIndexAt resolves the DOM side of the rule — which grid cell of
-// the current page the point is over — and defers the index math to
-// landingIndex. Returns null when the current page isn't mounted.
-function insertIndexAt(x, y) {
-  const pageEl = track.children[state.page];
-  if (!pageEl) return null;
-  const pageStart = state.page * pageSize();
-  const i = pageStart + cellIndexAt(pageEl, x, y);
-  return landingIndex(state.bookmarks, dnd.id, pageStart, pageSize(), i);
-}
-
-// updateTarget evaluates the insertion index under the pointer and moves
-// the dragged bookmark there in the flat list — the live reorder preview.
+// updateTarget resolves the drop index under the pointer on the CURRENT
+// page's grid and previews the move. A point outside the valid drop area
+// previews the committed layout instead — matching what a release there
+// (a cancel) restores.
 function updateTarget(x, y) {
-  const t = insertIndexAt(x, y);
-  if (!t || !applyLanding(state.bookmarks, dnd.id, t)) return;
-  render(); // the placeholder rides along to the item's new slot
-  thumbs.update(); // the mini pages mirror the live order too
+  const pageEl = track.children[state.page];
+  if (!pageEl || !overGrid(x, y)) {
+    setPreview(dnd.L0, null);
+    return;
+  }
+  let page;
+  let index;
+  if (state.page >= dnd.preview.length) {
+    // The dashed "+ 新页" page at the end: a drop starts a new last page.
+    page = dnd.L0.length;
+    index = 0;
+  } else {
+    page = mapPage(state.page);
+    // Slots past the page's items are empty: the item lands at the end
+    // of the page — index = len(L0 page without the dragged id).
+    const len = page < dnd.L0.length
+      ? dnd.L0[page].length - (page === dnd.srcPage ? 1 : 0)
+      : 0;
+    index = Math.min(cellIndexAt(pageEl, x, y), len);
+  }
+  setPreview(insert(dnd.L0, dnd.id, page, index, pageSize()), { page, index });
 }
 
-// moveToPageEnd splices the dragged bookmark to the last slot of page p —
-// index min((p+1)·size − 1, n−1) in the FINAL array, so the "+ 新页"
-// thumbnail (one past the last real page) clamps to the very end. `to` is
-// already adjusted for the removed item: after splice(from, 1) an insert
-// at `to` puts the item exactly on that index whichever side it came
-// from.
-function moveToPageEnd(p) {
-  const list = state.bookmarks;
-  const from = list.findIndex((b) => b.id === dnd.id);
-  if (from < 0) return;
-  const to = Math.min((p + 1) * pageSize() - 1, list.length - 1);
-  if (from === to) return;
-  const [bm] = list.splice(from, 1);
-  list.splice(to, 0, bm);
-}
-
-// gridMetrics returns the cell-grid geometry of a .page: the first
-// cell's origin (ox, oy), the full grid extent and the resolved tile/gap
-// metrics. The page centers its grid, so the origin is derived from the
-// element box, the grid padding, and the fixed tile metrics layout()
-// wrote on :root. Shared by cellIndexAt (point → cell) and overGrid
-// (point → valid drop area?).
+// gridMetrics returns the cell-grid geometry of the CURRENT .page: the
+// first cell's origin (ox, oy), the full grid extent and the resolved
+// tile/gap metrics. The page centers its grid, so the origin is derived
+// from the element box, the grid padding, and the fixed tile metrics
+// layout() wrote on :root. Shared by cellIndexAt (point → cell) and
+// overGrid (point → valid drop area?).
 function gridMetrics(pageEl) {
   const { rows, cols } = state.grid;
   const root = getComputedStyle(document.documentElement);
@@ -289,7 +293,13 @@ function gridMetrics(pageEl) {
   const padR = parseFloat(ps.paddingRight) || 0;
   const padT = parseFloat(ps.paddingTop) || 0;
   const padB = parseFloat(ps.paddingBottom) || 0;
-  const r = pageEl.getBoundingClientRect();
+  // Use the viewport's box, not pageEl.getBoundingClientRect(): right
+  // after an edge-dwell/thumbnail page flip the track's transform is
+  // still animating, so the current page's live rect is mid-slide. Every
+  // page is flex:0 0 100% of a viewport-sized track, so the CURRENT
+  // page's settled box is exactly the viewport's (callers only ever pass
+  // track.children[state.page]).
+  const r = viewport.getBoundingClientRect();
   const gridW = cols * tileW + (cols - 1) * gapX;
   const gridH = rows * tileH + (rows - 1) * gapY;
   const ox = r.left + padL + (r.width - padL - padR - gridW) / 2;
@@ -313,8 +323,7 @@ function overGrid(x, y) {
 }
 
 // cellIndexAt finds which grid cell of a .page contains (x, y). A point
-// outside the grid snaps to the nearest border cell: the live preview
-// may track the pointer anywhere — only the drop is area-restricted.
+// outside the grid snaps to the nearest border cell.
 function cellIndexAt(pageEl, x, y) {
   const { rows, cols } = state.grid;
   const g = gridMetrics(pageEl);
@@ -374,7 +383,7 @@ function setEdge(dir) {
 function edgeFlip(dir) {
   if (!dnd || dnd.edgeDir !== dir) return;
   const before = state.page;
-  goToPage(before + dir); // clamps at both ends, incl. the extra drag page
+  goToPage(before + dir); // clamps at both ends, incl. the "+ 新页" page
   // At the bound nothing flips; the timer stays disarmed until the
   // pointer leaves and re-enters the zone (edgeDir keeps the direction).
   if (state.page === before) return;
@@ -393,17 +402,19 @@ function cleanup() {
   lastUp = null; // next drag must not score a stale release point
   document.body.classList.remove('dnd-active', 'dnd-edge-left', 'dnd-edge-right');
   thumbs.hide(); // fades the strip; clears its dwell timer + resize hook
-  render(); // clears the placeholder marking and the extra drag page
+  render(); // the committed layout replaces the preview
 }
 
 registerTileDnd({
   begin, move, drop, cancel,
   active: () => dnd !== null,
   draggingId: () => (dnd ? dnd.id : null),
-  // While dragging on a full last page, app.js appends one empty page so an
-  // item can be carried "past the end" (it lands at the tail of the list).
+  // The layout app.js renders in place of the committed pages while a
+  // drag runs (arrays of ids per page), or null when idle.
+  previewPages: () => (dnd ? dnd.preview : null),
+  // The dashed "+ 新页" page (a "start a new page" drop target) stays
+  // available while the preview hasn't already grown past the committed
+  // layout — once it has, the new page is real and needs no twin.
   wantsExtraPage: () =>
-    dnd !== null &&
-    state.bookmarks.length > 0 &&
-    state.bookmarks.length % pageSize() === 0,
+    dnd !== null && dnd.preview.length <= dnd.L0.length,
 });

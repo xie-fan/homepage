@@ -1,3 +1,3 @@
-# Status — round 7 done
+# Status — round 8 done
 
-Search (1-3) 1b8e2e6, thumbs (5) cb10329, drop cancel + insertion rule (4,6) + ui_check round-7 checks in latest commit. ui_check 35/35, go test ok.
+Independent pages implemented (see PLAN.md Round 8). go test ok, ui_check 43/43, container migrated; backup /workspace/homepage-qa/pre-pages-backup.json.

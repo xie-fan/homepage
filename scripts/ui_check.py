@@ -89,6 +89,18 @@ cmd('Emulation.setEmulatedMedia', features=[{'name':'hover','value':'none'},{'na
 check('✎ reachable on hover:none', float(ev("getComputedStyle(document.querySelector('[data-id] .tile-edit')).opacity"))>0.3)
 cmd('Emulation.setEmulatedMedia', features=[])
 ev("document.activeElement.blur()")
+# baseline layout (server export incl. page/position) used to restore after drag tests
+BASE = ev("fetch('/api/export').then(r=>r.text())")
+def restore_all():
+    ev(f"fetch('/api/import?mode=replace',{{method:'POST',body:{json.dumps(BASE)}}}).then(r=>r.status)")
+LAY_JS = "fetch('/api/bookmarks').then(r=>r.json()).then(a=>a.map(b=>[b.url,b.page,b.position]))"
+def U(x):
+    m = dict(ev("fetch('/api/bookmarks').then(r=>r.json()).then(a=>a.map(b=>[String(b.id),b.url]))"))
+    return [m.get(str(i)) for i in x] if isinstance(x, list) else m.get(str(x))
+def lay():
+    a = ev(LAY_JS); P = {}
+    for i,pg,pos in a: P.setdefault(pg,[]).append((pos,i))
+    return [[i for _,i in sorted(P[k])] for k in sorted(P)]
 # drag thumbnails
 before = ev("fetch('/api/bookmarks').then(r=>r.json()).then(a=>a.map(b=>b.id))")
 a = ev("(()=>{const v=[...document.querySelectorAll('[data-id]')].filter(e=>{const r=e.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth});const r=v[0].getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2-6,+v[0].dataset.id]})()")
@@ -104,13 +116,11 @@ if thumbs and len(thumbs)>=2:
     time.sleep(0.7); pg=ev(page)
     check('dwell on thumbnail switches page', pg==1 or pg==(ev(page)), f'page idx {pg}')
     mouse('mouseReleased',t2[1],t2[2],0); time.sleep(1.5)
-    after = ev("fetch('/api/bookmarks').then(r=>r.json()).then(a=>a.map(b=>b.id))")
-    per = ev("(()=>{const s=document.querySelectorAll('.page')[0];return s?s.querySelectorAll('[data-id]').length:0})()")
-    idx = after.index(a[2])
-    check('drop on thumbnail moves to end of that page', idx==min(2*24-1, len(after)-1) or idx>=24, f'new index {idx}, n={len(after)}')
+    L = lay()
+    check('drop on thumbnail appends to end of that page', len(L)>1 and L[1][-1]==U(a[2]) and len(L[0])==23, [len(p) for p in L])
     check('strip hidden after drop', not ev("[...document.querySelectorAll('[role=listbox] [aria-label^=\"第\"]')].some(e=>{const r=e.getBoundingClientRect();return r.width>0&&getComputedStyle(e.closest('[role=listbox]')||e).visibility!=='hidden'&&+getComputedStyle(e.closest('[role=listbox]')||e).opacity>0.05})"))
     # restore order
-    ev(f"fetch('/api/bookmarks/order',{{method:'PUT',body:JSON.stringify({{ids:{json.dumps(before)}}})}}).then(r=>r.status)")
+    restore_all()
     print('order restored', ev("fetch('/api/bookmarks').then(r=>r.json()).then(a=>a.map(b=>b.id))")==before)
 # gear click after drag
 gear = ev("(()=>{const b=[...document.querySelectorAll('button')].find(b=>b.textContent.includes('⚙'));const r=b.getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2]})()")
@@ -131,11 +141,10 @@ for w in (360,390):
     check(f'header ok at {w}px', o and not o['overlap'] and not o['hscroll'], o)
     if w==390: shot('feat-mobile-390')
 
-# ---------- round 7 regression checks ----------
+# ---------- round 7/8 checks ----------
 cmd('Emulation.setDeviceMetricsOverride', width=1280, height=800, deviceScaleFactor=1, mobile=False)
 cmd('Page.reload'); time.sleep(2.5)
 ids_now = lambda: ev("fetch('/api/bookmarks').then(r=>r.json()).then(a=>a.map(b=>b.id))")
-def restore(order): ev(f"fetch('/api/bookmarks/order',{{method:'PUT',body:JSON.stringify({{ids:{json.dumps(order)}}})}}).then(r=>r.status)")
 orig_order = ids_now()
 def esc_clear():
     key('Escape'); time.sleep(0.3); ev("document.activeElement&&document.activeElement.blur()")
@@ -166,60 +175,88 @@ cmd('Input.dispatchKeyEvent', type='keyUp', key='Backspace', code='Backspace', w
 p0 = ev(page); key('ArrowRight'); time.sleep(0.8); p1 = ev(page); key('ArrowLeft'); time.sleep(0.8)
 check('3 empty focused search box: ←/→ page the grid', ev(f"{SEARCH}.value")=='' and p1!=p0, f'{p0}->{p1}')
 esc_clear(); time.sleep(0.3)
-tile_xy = lambda i: ev(f"(()=>{{const v=[...document.querySelectorAll('[data-id]')].filter(e=>{{const r=e.getBoundingClientRect();return r.width>0&&r.left>=0&&r.right<=innerWidth}});const r=v[{i}].getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2-6,+v[{i}].dataset.id]}})()")
-def drag(path, hold=0.03, settle=0.4):
-    x,y = path[0]; mouse('mouseMoved',x,y,0); mouse('mousePressed',x,y)
-    for (a,b) in path[1:]: mouse('mouseMoved',a,b); time.sleep(hold)
-    time.sleep(settle); mouse('mouseReleased',*path[-1],0); time.sleep(1.2)
+tile_xy = lambda i: ev(f"(()=>{{const v=[...document.querySelectorAll('[data-id]')].filter(e=>{{const r=e.getBoundingClientRect();return r.width>0&&r.left>=0&&r.right<=innerWidth&&!e.classList.contains('drag-clone')}});const r=v[{i}].getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2-6,+v[{i}].dataset.id]}})()")
+shown_ids = lambda: ev("[...document.querySelectorAll('[data-id]')].filter(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.left>=0&&r.right<=innerWidth&&!e.classList.contains('drag-clone')}).map(e=>+e.dataset.id)")
+def cell_xy(i):
+    c, r = i % 6, i // 6
+    return [G0[0] + c*(G1[0]-G0[0]), G0[1] + r*(G6[1]-G0[1])]
+_old_cell_xy = lambda i: ev(f"(()=>{{const pg=[...document.querySelectorAll('.page')].find(p=>{{const r=p.getBoundingClientRect();return r.left>=-2&&r.left<innerWidth/2}});const g=(pg.querySelector('.grid')||pg);const cs=getComputedStyle(g);const cols=cs.gridTemplateColumns.split(' ').length;const t=g.querySelector('[data-id]').getBoundingClientRect();const gr=g.getBoundingClientRect();const cg=parseFloat(cs.columnGap)||0,rg=parseFloat(cs.rowGap)||0;const c={i}%cols,r=Math.floor({i}/cols);return [gr.left+c*(t.width+cg)+t.width/2, gr.top+r*(t.height+rg)+t.height/2]}})()")
 def lerp(a,b,n=10): return [(a[0]+(b[0]-a[0])*k/n, a[1]+(b[1]-a[1])*k/n) for k in range(n+1)]
-# 4. drop outside grid cancels
-a = tile_xy(0)
-drag(lerp((a[0],a[1]),(a[0]+40,a[1]+60),4) + lerp((a[0]+40,a[1]+60),(1180,640),8))
-check('4 drop outside grid cancels (order unchanged)', ids_now()==orig_order and ev(vis)[0]==ev(vis)[0])
-restore(orig_order); cmd('Page.reload'); time.sleep(2)
-# 6a. same page: drop on slot 5 -> lands at index 5
-a = tile_xy(0); b = tile_xy(5)
-drag(lerp((a[0],a[1]),(b[0],b[1]),12))
-o = ids_now()
-check('6a drop on a tile places dragged tile right BEFORE it (same page)', o.index(a[2])==o.index(b[2])-1, f'dragged at {o.index(a[2])}, target at {o.index(b[2])}')
-restore(orig_order); cmd('Page.reload'); time.sleep(2)
-# 5 + 6b. fast drag to thumbnail of page 2, dwell, drop on first tile slot of page 2 -> index 24 (before that tile)
-a = tile_xy(2)
-x,y=a[0],a[1]; mouse('mouseMoved',x,y,0); mouse('mousePressed',x,y)
-for k in range(1,4): mouse('mouseMoved',x+5*k,y+5*k); time.sleep(0.01)
-th = ev("[...document.querySelectorAll('[role=listbox] [aria-label^=\"第\"]')].map(e=>{const r=e.getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2,r.width,r.height]})")
+def press(x,y):
+    mouse('mouseMoved',x,y,0); mouse('mousePressed',x,y)
+    for k in range(1,4): mouse('mouseMoved',x+5*k,y+5*k); time.sleep(0.01)
+def path(pts, hold=0.03):
+    for pt in pts: mouse('mouseMoved',*pt); time.sleep(hold)
+def release(x,y): time.sleep(0.4); mouse('mouseReleased',x,y,0); time.sleep(1.2)
+def thumbs_xy(): return ev("[...document.querySelectorAll('[role=listbox] [aria-label^=\"第\"]')].map(e=>{const r=e.getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2,r.width,r.height]})")
+def reset(): restore_all(); cmd('Page.reload'); time.sleep(2)
+L0 = lay()
+G0, G1, G6 = tile_xy(0), tile_xy(1), tile_xy(6)
+check('8.0 baseline: independent pages 24 + 3', [len(p) for p in L0]==[24,3], [len(p) for p in L0])
+# 4 / 8d. drop outside grid: preview returns to original while outside, release cancels
+a = tile_xy(0); press(a[0],a[1])
+path(lerp((a[0]+15,a[1]+15),tile_xy(5)[:2],6)); time.sleep(0.3)
+path(lerp(tile_xy(5)[:2],(1180,640),6)); time.sleep(0.4)
+outside_preview = shown_ids()
+release(1180,640)
+check('4/8d preview reverts to original slot while outside grid', U(outside_preview[:24])==L0[0], outside_preview[:8])
+LL=lay(); check('4 drop outside grid cancels (layout unchanged)', LL==L0, (sum(LL,[]).index(L0[0][0]), [len(p) for p in LL], outside_preview[:3]))
+reset()
+# 8a. same page: hovered slot insert
+a = tile_xy(0); b = tile_xy(5); press(a[0],a[1]); path(lerp((a[0]+15,a[1]+15),(b[0],b[1]),10)); release(b[0],b[1])
+L = lay(); exp = [x for x in L0[0] if x!=U(a[2])]; exp.insert(5,U(a[2]))
+check('8a same-page drag inserts at hovered slot', L[0]==exp and L[1]==L0[1], L[0][:8])
+reset()
+# 5 + 8b. cross-page into page with room: A (page0 slot2) -> page1 slot1; page0 keeps a gap
+a = tile_xy(2); press(a[0],a[1])
+th = thumbs_xy()
 check('5a thumbnails present immediately at drag start', th and len(th)>=2, th)
 check('5b thumbnail hit area >= 64x48', th and all(w>=64 and h>=48 for _,_,w,h in th), th)
 if th and len(th)>=2:
-    for pt in lerp((x+15,y+15),(th[1][0],th[1][1]),3): mouse('mouseMoved',*pt); time.sleep(0.01)
-    hit = ev(f"(()=>{{const e=document.elementFromPoint({th[1][0]},{th[1][1]});return !!(e&&e.closest('[role=listbox]'))}})()")
-    check('5c ghost does not block thumbnail hit-testing', hit)
+    path(lerp((a[0]+15,a[1]+15),(th[1][0],th[1][1]),3), 0.01)
+    check('5c ghost does not block thumbnail hit-testing', ev(f"(()=>{{const e=document.elementFromPoint({th[1][0]},{th[1][1]});return !!(e&&e.closest('[role=listbox]'))}})()"))
     time.sleep(0.8)
     check('5d dwell on page-2 thumbnail switched page', ev(page)==1, ev(page))
-    tgt = ev("(()=>{const v=[...document.querySelectorAll('[data-id]')].filter(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.left>=0&&r.right<=innerWidth&&!e.classList.contains('tile-source')&&!e.classList.contains('dragging')});return v.map(e=>{const r=e.getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2-6,+e.dataset.id]})})()")
-    t2 = tgt[1]  # second tile on page 2 (non-boundary case)
-    for pt in lerp((th[1][0],th[1][1]),(t2[0],t2[1]),8): mouse('mouseMoved',*pt); time.sleep(0.03)
-    time.sleep(0.4)
-    # preview just before release: page-2 order as shown; the drop must commit exactly that
-    shown = ev("[...document.querySelectorAll('[data-id]')].filter(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.left>=0&&r.right<=innerWidth&&!e.classList.contains('drag-clone')}).map(e=>+e.dataset.id)")
-    mouse('mouseReleased',t2[0],t2[1],0); time.sleep(1.2)
-    o = ids_now()
-    i = shown.index(a[2]) if a[2] in shown else -1
-    nxt = shown[i+1] if 0 <= i < len(shown)-1 else None
-    check('6b cross-page drop commits the previewed order (A right before the tile after it)', o[24:24+len(shown)]==shown and nxt is not None and o.index(a[2])==o.index(nxt)-1, f'shown {shown} committed {o[24:]}')
-    restore(orig_order); cmd('Page.reload'); time.sleep(2)
-    # 6c. hovering the FIRST tile of page 2 puts the tile at page 2's first slot
-    a = tile_xy(2); x,y=a[0],a[1]; mouse('mouseMoved',x,y,0); mouse('mousePressed',x,y)
-    for k in range(1,4): mouse('mouseMoved',x+5*k,y+5*k); time.sleep(0.01)
-    for pt in lerp((x+15,y+15),(th[1][0],th[1][1]),3): mouse('mouseMoved',*pt); time.sleep(0.01)
-    time.sleep(0.9)
-    f = ev("(()=>{const v=[...document.querySelectorAll('[data-id]')].filter(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.left>=0&&r.right<=innerWidth&&!e.classList.contains('tile-source')&&!e.classList.contains('dragging')});const r=v[0].getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2-6]})()")
-    for pt in lerp((th[1][0],th[1][1]),(f[0],f[1]),8): mouse('mouseMoved',*pt); time.sleep(0.03)
-    time.sleep(0.4); mouse('mouseReleased',f[0],f[1],0); time.sleep(1.2)
-    o = ids_now()
-    check('6c drop on first tile of page 2 -> first slot of page 2', o.index(a[2]) == 24, f'dragged at {o.index(a[2])}')
-restore(orig_order)
-check('order restored after round-7 checks', ids_now()==orig_order)
+    c = cell_xy(1); path(lerp((th[1][0],th[1][1]),c,8)); release(*c)
+    L = lay()
+    check('8b cross-page: inserted at hovered slot, source page keeps gap (nothing pulled)', len(L)==2 and len(L[0])==23 and L[1]==[L0[1][0],U(a[2])]+L0[1][1:] and L[0]==[x for x in L0[0] if x!=U(a[2])], [len(p) for p in L])
+reset()
+# 8c. cross-page into a FULL page: page1 first -> page0 slot 0 => page0's last pushed to front of page1
+cmd('Input.dispatchKeyEvent', type='rawKeyDown', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39); cmd('Input.dispatchKeyEvent', type='keyUp', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39); time.sleep(0.8)
+a = tile_xy(0); press(a[0],a[1]); th = thumbs_xy()
+if th and len(th)>=2:
+    path(lerp((a[0]+15,a[1]+15),(th[0][0],th[0][1]),3), 0.01); time.sleep(0.8)
+    c = cell_xy(0); path(lerp((th[0][0],th[0][1]),c,8))
+    time.sleep(0.4); prev = shown_ids()
+    release(*c)
+    L = lay()
+    check('8c drop into full page: its last item cascades to front of next page', L[0]==[U(a[2])]+L0[0][:23] and L[1]==[L0[0][23]]+L0[1][1:], [len(p) for p in L])
+    check('8c preview matched committed layout', U(prev[:24])==L[0], prev[:5])
+reset()
+# 8e. thumbnail drop onto a full page: appended, overflow cascades (dragged item lands at front of next page)
+cmd('Input.dispatchKeyEvent', type='rawKeyDown', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39); cmd('Input.dispatchKeyEvent', type='keyUp', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39); time.sleep(0.8)
+a = tile_xy(1); press(a[0],a[1]); th = thumbs_xy()
+if th:
+    path(lerp((a[0]+15,a[1]+15),(th[0][0],th[0][1]),3), 0.01); release(th[0][0],th[0][1])
+    L = lay()
+    check('8e thumbnail drop on full page cascades', len(L[0])==24 and L[0]==L0[0] and L[1][0]==U(a[2]), L[1])
+reset()
+# 8f. '+' add from page 0 when page 0 is full -> end of page 1; from last full pages -> new page
+r = ev("fetch('/api/bookmarks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:'T1',url:'https://t1.example.org/',page:0})}).then(r=>r.json())")
+check("8f add from full page 0 -> end of first page with room (page 1)", r.get('page')==1 and r.get('position')==3, r)
+# 8g. grid shrink cascades (visual order preserved), grow does not pull
+flat_before = sum(lay(), [])
+ev("fetch('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({grid:{rows:3,cols:4}})}).then(r=>r.status)")
+L = lay(); check('8g grid shrink 4x6->3x4: overflow cascades, order kept, no page > 12', all(len(p)<=12 for p in L) and sum(L,[])==flat_before, [len(p) for p in L])
+before = lay()
+ev("fetch('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({grid:{rows:4,cols:6}})}).then(r=>r.status)")
+check('8g grid grow: nothing moves', lay()==before, [len(p) for p in lay()])
+# 8h. emptying a page removes it
+reset()
+ids1 = ev("fetch('/api/bookmarks').then(r=>r.json()).then(a=>a.filter(b=>b.page===1).map(b=>b.id))")
+for i in ids1: ev(f"fetch('/api/bookmarks/{i}',{{method:'DELETE'}}).then(r=>r.status)")
+check('8h page that becomes empty is removed', len(lay())==1, [len(p) for p in lay()])
+reset()
+check('layout restored after round-8 checks', lay()==L0)
 
 print(f"\n{sum(r for _,r in results)}/{len(results)} checks passed")
-p.terminate()
