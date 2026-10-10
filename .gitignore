@@ -2,3 +2,4 @@ data/
 .cache/
 /homepage
 *.zip
+docker-compose.override.yml

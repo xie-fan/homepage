@@ -1,5 +1,6 @@
-# Status (in progress)
+# Status
 
-- Done & committed: Tasks 1–5 (scaffold, DB/migrations, store, REST API, favicon), Task 8 (Docker/README).
-- Done (uncommitted): Task 6 (frontend, Devin run t6). Pending: Task 7 (drag & drop), final verification, seeding, screenshots, zip.
-- Devin prompts/outputs: /workspace/devin-runs/
+All planned tasks (1–9) done and committed. `go test ./...` green (69 tests).
+Docker image builds (~13 MB distroless); `docker compose up -d` serves on :8080 with a named volume.
+Seed sample data: `scripts/seed.sh http://localhost:8080`.
+Known gaps: see README / final report (no auth, no healthcheck, some sites block icon fetching → letter avatar).
