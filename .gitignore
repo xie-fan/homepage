@@ -1,0 +1,6 @@
+data/
+.cache/
+/homepage
+*.zip
+docker-compose.override.yml
+__pycache__/
