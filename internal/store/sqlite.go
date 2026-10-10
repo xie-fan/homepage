@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"homepage/internal/layout"
 )
 
 // bookmarkCols is the shared SELECT column list; keep it in sync with
 // scanBookmark.
-const bookmarkCols = `id, title, url, position, icon_path, icon_status, created_at, updated_at`
+const bookmarkCols = `id, title, url, page, position, icon_path, icon_status, created_at, updated_at`
 
 // NewSQLite returns a Store whose interfaces are implemented on db
 // (opened and migrated via internal/db).
@@ -34,37 +36,46 @@ type sqliteBookmarks struct{ db *sql.DB }
 type sqliteSettings struct{ db *sql.DB }
 
 func (s *sqliteBookmarks) List(ctx context.Context) ([]Bookmark, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+bookmarkCols+` FROM bookmarks ORDER BY position, id`)
-	if err != nil {
-		return nil, fmt.Errorf("list bookmarks: %w", err)
-	}
-	defer rows.Close()
-
-	bs := []Bookmark{}
-	for rows.Next() {
-		b, err := scanBookmark(rows)
-		if err != nil {
-			return nil, fmt.Errorf("list bookmarks: %w", err)
-		}
-		bs = append(bs, b)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list bookmarks: %w", err)
-	}
-	return bs, nil
+	return listBookmarks(ctx, s.db)
 }
 
 func (s *sqliteBookmarks) Get(ctx context.Context, id int64) (Bookmark, error) {
 	return getBookmark(ctx, s.db, id)
 }
 
-func (s *sqliteBookmarks) Create(ctx context.Context, title, url string) (Bookmark, error) {
-	bs, err := s.AppendMany(ctx, []NewBookmark{{Title: title, URL: url}})
+func (s *sqliteBookmarks) Create(ctx context.Context, title, url string, fromPage int) (Bookmark, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Bookmark{}, fmt.Errorf("create bookmark: %w", err)
+	}
+	defer tx.Rollback()
+
+	L, prev, err := loadLayout(ctx, tx)
 	if err != nil {
 		return Bookmark{}, err
 	}
-	return bs[0], nil
+	cap, err := gridCap(ctx, tx)
+	if err != nil {
+		return Bookmark{}, err
+	}
+	// fromPage is the page the user is viewing: a page past the end
+	// means "the last page" (and Add creates a new one only when even
+	// that is full).
+	fromPage = max(0, min(fromPage, len(L)-1))
+
+	b, err := insertBookmark(ctx, tx, NewBookmark{Title: title, URL: url})
+	if err != nil {
+		return Bookmark{}, err
+	}
+	L = layout.Add(L, b.ID, fromPage, cap)
+	if err := writeLayout(ctx, tx, prev, L); err != nil {
+		return Bookmark{}, err
+	}
+	b.Page, b.Position = slotOf(L, b.ID)
+	if err := tx.Commit(); err != nil {
+		return Bookmark{}, fmt.Errorf("create bookmark: %w", err)
+	}
+	return b, nil
 }
 
 func (s *sqliteBookmarks) Update(ctx context.Context, id int64, title, url string) (Bookmark, error) {
@@ -105,19 +116,20 @@ func (s *sqliteBookmarks) Delete(ctx context.Context, id int64) error {
 	}
 	defer tx.Rollback()
 
-	res, err := tx.ExecContext(ctx, `DELETE FROM bookmarks WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete bookmark %d: %w", id, err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("bookmark %d: %w", id, ErrNotFound)
-	}
-	// Compact the remaining positions to 0..n-1 in the same transaction.
-	ids, err := listIDs(ctx, tx)
+	L, prev, err := loadLayout(ctx, tx)
 	if err != nil {
 		return err
 	}
-	if err := setPositions(ctx, tx, ids); err != nil {
+	if _, ok := prev[id]; !ok {
+		return fmt.Errorf("bookmark %d: %w", id, ErrNotFound)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM bookmarks WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete bookmark %d: %w", id, err)
+	}
+	// Close up the page, dropping it when left empty, in the same
+	// transaction as the DELETE.
+	if err := writeLayout(ctx, tx, prev, layout.Remove(L, id)); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -126,27 +138,42 @@ func (s *sqliteBookmarks) Delete(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (s *sqliteBookmarks) Reorder(ctx context.Context, ids []int64) error {
+func (s *sqliteBookmarks) Move(ctx context.Context, id int64, page, index int) ([]Bookmark, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("reorder bookmarks: %w", err)
+		return nil, fmt.Errorf("move bookmark %d: %w", id, err)
 	}
 	defer tx.Rollback()
 
-	existing, err := listIDs(ctx, tx)
+	L, prev, err := loadLayout(ctx, tx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := checkPermutation(existing, ids); err != nil {
-		return err
+	if page < 0 || index < 0 {
+		return nil, fmt.Errorf("%w: negative page %d or index %d", ErrInvalidMove, page, index)
 	}
-	if err := setPositions(ctx, tx, ids); err != nil {
-		return err
+	if page > len(L) {
+		return nil, fmt.Errorf("%w: page %d beyond last page %d", ErrInvalidMove, page, len(L))
+	}
+	if _, ok := prev[id]; !ok {
+		return nil, fmt.Errorf("bookmark %d: %w", id, ErrNotFound)
+	}
+	cap, err := gridCap(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	L = layout.Insert(L, id, page, index, cap)
+	if err := writeLayout(ctx, tx, prev, L); err != nil {
+		return nil, err
+	}
+	bs, err := listBookmarks(ctx, tx)
+	if err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("reorder bookmarks: %w", err)
+		return nil, fmt.Errorf("move bookmark %d: %w", id, err)
 	}
-	return nil
+	return bs, nil
 }
 
 func (s *sqliteBookmarks) SetIcon(ctx context.Context, id int64, path, status string) error {
@@ -172,14 +199,45 @@ func (s *sqliteBookmarks) ReplaceAll(ctx context.Context, items []NewBookmark) (
 	if _, err := tx.ExecContext(ctx, `DELETE FROM bookmarks`); err != nil {
 		return nil, fmt.Errorf("replace bookmarks: %w", err)
 	}
-	bs, err := insertAll(ctx, tx, items, 0)
+	if len(items) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("replace bookmarks: %w", err)
+		}
+		return []Bookmark{}, nil
+	}
+	cap, err := gridCap(ctx, tx)
 	if err != nil {
 		return nil, err
+	}
+
+	// Until rows exist there are no ids: the layout is expressed in
+	// item indices and each item lands at the slot its index gets.
+	L := groupByPage(items)
+	if L == nil {
+		ids := make([]int64, len(items))
+		for i := range items {
+			ids[i] = int64(i)
+		}
+		L = layout.FromFlat(ids, cap)
+	} else {
+		L = layout.Reflow(L, cap)
+	}
+
+	created := make([]Bookmark, len(items))
+	now := time.Now().UTC()
+	for p, pg := range L {
+		for pos, k := range pg {
+			b, err := insertBookmarkAt(ctx, tx, items[k], p, pos, now)
+			if err != nil {
+				return nil, err
+			}
+			created[k] = b
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("replace bookmarks: %w", err)
 	}
-	return bs, nil
+	return created, nil
 }
 
 func (s *sqliteBookmarks) AppendMany(ctx context.Context, items []NewBookmark) ([]Bookmark, error) {
@@ -192,19 +250,34 @@ func (s *sqliteBookmarks) AppendMany(ctx context.Context, items []NewBookmark) (
 	}
 	defer tx.Rollback()
 
-	var pos int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(position) + 1, 0) FROM bookmarks`).Scan(&pos); err != nil {
-		return nil, fmt.Errorf("append bookmarks: %w", err)
-	}
-	bs, err := insertAll(ctx, tx, items, pos)
+	L, prev, err := loadLayout(ctx, tx)
 	if err != nil {
 		return nil, err
+	}
+	cap, err := gridCap(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	created := make([]Bookmark, len(items))
+	now := time.Now().UTC()
+	for i, nb := range items {
+		b, err := insertBookmarkAt(ctx, tx, nb, 0, 0, now)
+		if err != nil {
+			return nil, err
+		}
+		created[i] = b
+		L = layout.Add(L, b.ID, 0, cap)
+	}
+	if err := writeLayout(ctx, tx, prev, L); err != nil {
+		return nil, err
+	}
+	for i := range created {
+		created[i].Page, created[i].Position = slotOf(L, created[i].ID)
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("append bookmarks: %w", err)
 	}
-	return bs, nil
+	return created, nil
 }
 
 func (s *sqliteSettings) Get(ctx context.Context) (Settings, error) {
@@ -263,11 +336,26 @@ func (s *sqliteSettings) Put(ctx context.Context, st Settings) error {
 		return fmt.Errorf("put settings: %w", err)
 	}
 	defer tx.Rollback()
+	old, err := storedGrid(ctx, tx)
+	if err != nil {
+		return err
+	}
 	for _, kv := range [][2]string{{"grid", string(grid)}, {"spacing", string(spacing)}} {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
 			kv[0], kv[1]); err != nil {
 			return fmt.Errorf("put settings: %w", err)
+		}
+	}
+	// A changed grid reflows every page in the same transaction.
+	if st.Grid != old {
+		L, prev, err := loadLayout(ctx, tx)
+		if err != nil {
+			return err
+		}
+		L = layout.Reflow(L, st.Grid.Rows*st.Grid.Cols)
+		if err := writeLayout(ctx, tx, prev, L); err != nil {
+			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -290,90 +378,54 @@ func getBookmark(ctx context.Context, q querier, id int64) (Bookmark, error) {
 	return b, nil
 }
 
-// listIDs returns every bookmark id in display order.
-func listIDs(ctx context.Context, q querier) ([]int64, error) {
-	rows, err := q.QueryContext(ctx, `SELECT id FROM bookmarks ORDER BY position, id`)
+// listBookmarks returns all bookmarks ordered by page, then position.
+func listBookmarks(ctx context.Context, q querier) ([]Bookmark, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT `+bookmarkCols+` FROM bookmarks ORDER BY page, position, id`)
 	if err != nil {
-		return nil, fmt.Errorf("list bookmark ids: %w", err)
+		return nil, fmt.Errorf("list bookmarks: %w", err)
 	}
 	defer rows.Close()
 
-	var ids []int64
+	bs := []Bookmark{}
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("list bookmark ids: %w", err)
+		b, err := scanBookmark(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list bookmarks: %w", err)
 		}
-		ids = append(ids, id)
+		bs = append(bs, b)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list bookmark ids: %w", err)
-	}
-	return ids, nil
-}
-
-// setPositions assigns each id its slice index as its new position.
-func setPositions(ctx context.Context, tx *sql.Tx, ids []int64) error {
-	stmt, err := tx.PrepareContext(ctx, `UPDATE bookmarks SET position = ? WHERE id = ?`)
-	if err != nil {
-		return fmt.Errorf("reorder bookmarks: %w", err)
-	}
-	defer stmt.Close()
-	for pos, id := range ids {
-		if _, err := stmt.ExecContext(ctx, pos, id); err != nil {
-			return fmt.Errorf("reorder bookmark %d: %w", id, err)
-		}
-	}
-	return nil
-}
-
-// checkPermutation verifies ids lists each existing id exactly once.
-func checkPermutation(existing, ids []int64) error {
-	if len(ids) != len(existing) {
-		return fmt.Errorf("%w: got %d ids, have %d bookmarks", ErrInvalidOrder, len(ids), len(existing))
-	}
-	set := make(map[int64]bool, len(existing))
-	for _, id := range existing {
-		set[id] = false
-	}
-	for _, id := range ids {
-		seen, ok := set[id]
-		if !ok {
-			return fmt.Errorf("%w: unknown id %d", ErrInvalidOrder, id)
-		}
-		if seen {
-			return fmt.Errorf("%w: duplicate id %d", ErrInvalidOrder, id)
-		}
-		set[id] = true
-	}
-	return nil
-}
-
-// insertAll inserts items at consecutive positions starting at pos,
-// inside q. All new rows share one timestamp and pending icon state.
-func insertAll(ctx context.Context, q querier, items []NewBookmark, pos int) ([]Bookmark, error) {
-	now := time.Now().UTC()
-	ts := formatTime(now)
-	bs := make([]Bookmark, 0, len(items))
-	for _, nb := range items {
-		res, err := q.ExecContext(ctx,
-			`INSERT INTO bookmarks (title, url, position, icon_status, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-			nb.Title, nb.URL, pos, IconPending, ts, ts)
-		if err != nil {
-			return nil, fmt.Errorf("insert bookmark %q: %w", nb.Title, err)
-		}
-		id, err := res.LastInsertId()
-		if err != nil {
-			return nil, fmt.Errorf("insert bookmark %q: %w", nb.Title, err)
-		}
-		bs = append(bs, Bookmark{
-			ID: id, Title: nb.Title, URL: nb.URL, Position: pos,
-			IconStatus: IconPending, CreatedAt: now, UpdatedAt: now,
-		})
-		pos++
+		return nil, fmt.Errorf("list bookmarks: %w", err)
 	}
 	return bs, nil
+}
+
+// insertBookmark inserts one bookmark row at placeholder slot (0,0)
+// with a pending icon; a layout op decides the real slot right after.
+func insertBookmark(ctx context.Context, q querier, nb NewBookmark) (Bookmark, error) {
+	return insertBookmarkAt(ctx, q, nb, 0, 0, time.Now().UTC())
+}
+
+// insertBookmarkAt inserts one bookmark row at page/position with a
+// pending icon and the shared timestamp now.
+func insertBookmarkAt(ctx context.Context, q querier, nb NewBookmark, page, pos int, now time.Time) (Bookmark, error) {
+	ts := formatTime(now)
+	res, err := q.ExecContext(ctx,
+		`INSERT INTO bookmarks (title, url, page, position, icon_status, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		nb.Title, nb.URL, page, pos, IconPending, ts, ts)
+	if err != nil {
+		return Bookmark{}, fmt.Errorf("insert bookmark %q: %w", nb.Title, err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return Bookmark{}, fmt.Errorf("insert bookmark %q: %w", nb.Title, err)
+	}
+	return Bookmark{
+		ID: id, Title: nb.Title, URL: nb.URL, Page: page, Position: pos,
+		IconStatus: IconPending, CreatedAt: now, UpdatedAt: now,
+	}, nil
 }
 
 // scanBookmark reads a row produced by a SELECT of bookmarkCols. Times
@@ -381,7 +433,7 @@ func insertAll(ctx context.Context, q querier, items []NewBookmark, pos int) ([]
 func scanBookmark(row scanner) (Bookmark, error) {
 	var b Bookmark
 	var created, updated string
-	if err := row.Scan(&b.ID, &b.Title, &b.URL, &b.Position,
+	if err := row.Scan(&b.ID, &b.Title, &b.URL, &b.Page, &b.Position,
 		&b.IconPath, &b.IconStatus, &created, &updated); err != nil {
 		return Bookmark{}, err
 	}

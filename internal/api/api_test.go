@@ -214,7 +214,7 @@ func TestBookmarkCRUD(t *testing.T) {
 	srv, _, icons := newTestServer(t)
 
 	b := postBookmark(t, srv, "Example", "https://example.com")
-	if b.ID == 0 || b.Position != 0 || b.IconStatus != store.IconPending {
+	if b.ID == 0 || b.Page != 0 || b.Position != 0 || b.IconStatus != store.IconPending {
 		t.Fatalf("created = %+v", b)
 	}
 	// Creating enqueues an icon fetch for the new bookmark.
@@ -358,53 +358,229 @@ func TestNotFound(t *testing.T) {
 	}
 }
 
-// TestReorder exercises PUT /api/bookmarks/order. Because the {id}
-// handler would 400 on the non-numeric id "order", a 200 here proves the
-// literal route wins over PUT /api/bookmarks/{id}.
-func TestReorder(t *testing.T) {
+// seedBookmarks creates n bookmarks b00.. via the store (fast; no
+// icon enqueues) and returns them in create order.
+func seedBookmarks(t *testing.T, st *store.Store, n int) []store.Bookmark {
+	t.Helper()
+	out := make([]store.Bookmark, n)
+	for i := range out {
+		name := fmt.Sprintf("b%02d", i)
+		b, err := st.Create(context.Background(), name, "https://"+name+".example.com", 0)
+		if err != nil {
+			t.Fatalf("seed Create(%q): %v", name, err)
+		}
+		out[i] = b
+	}
+	return out
+}
+
+// pageOf groups a bookmark list (ordered by page, position) into pages
+// of titles, asserting each page's positions are compact from 0.
+func pageOf(t *testing.T, list []store.Bookmark) [][]string {
+	t.Helper()
+	var pages [][]string
+	for _, b := range list {
+		for len(pages) <= b.Page {
+			pages = append(pages, []string{})
+		}
+		if b.Position != len(pages[b.Page]) {
+			t.Errorf("bookmark %q position %d, want %d", b.Title, b.Position, len(pages[b.Page]))
+		}
+		pages[b.Page] = append(pages[b.Page], b.Title)
+	}
+	return pages
+}
+
+// samePages reports whether two page groupings hold the same titles.
+func samePages(a, b [][]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !slices.Equal(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// listPages returns all bookmarks grouped into pages of titles.
+func listPages(t *testing.T, srv *httptest.Server) [][]string {
+	t.Helper()
+	var list []store.Bookmark
+	reqJSON(t, srv, http.MethodGet, "/api/bookmarks", nil, &list)
+	return pageOf(t, list)
+}
+
+func bookmarkTitles(bs []store.Bookmark) []string {
+	out := make([]string, len(bs))
+	for i, b := range bs {
+		out[i] = b.Title
+	}
+	return out
+}
+
+// TestMove exercises POST /api/bookmarks/move: the response is the
+// whole list in display order and is what got persisted.
+func TestMove(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	a := postBookmark(t, srv, "a", "https://a.example.com")
-	b := postBookmark(t, srv, "b", "https://b.example.com")
-	c := postBookmark(t, srv, "c", "https://c.example.com")
+	postBookmark(t, srv, "b", "https://b.example.com")
+	postBookmark(t, srv, "c", "https://c.example.com")
 
 	var list []store.Bookmark
-	code := reqJSON(t, srv, http.MethodPut, "/api/bookmarks/order",
-		map[string][]int64{"ids": {c.ID, a.ID, b.ID}}, &list)
+	code := reqJSON(t, srv, http.MethodPost, "/api/bookmarks/move",
+		map[string]any{"id": a.ID, "page": 0, "index": 2}, &list)
 	if code != http.StatusOK {
-		t.Fatalf("reorder = %d, want 200", code)
+		t.Fatalf("move = %d, want 200", code)
 	}
-	var got []string
-	for _, bm := range list {
-		got = append(got, bm.Title)
+	if got := bookmarkTitles(list); !slices.Equal(got, []string{"b", "c", "a"}) {
+		t.Fatalf("move response = %v", got)
 	}
-	if !slices.Equal(got, []string{"c", "a", "b"}) {
-		t.Fatalf("order = %v", got)
-	}
-	if got := listTitles(t, srv); !slices.Equal(got, []string{"c", "a", "b"}) {
-		t.Fatalf("persisted order = %v", got)
+	want := [][]string{{"b", "c", "a"}}
+	if got := listPages(t, srv); !samePages(got, want) {
+		t.Fatalf("persisted pages = %v", got)
 	}
 
-	for name, ids := range map[string][]int64{
-		"missing id": {a.ID, b.ID},
-		"unknown id": {a.ID, b.ID, c.ID, 9999},
-		"duplicate":  {a.ID, a.ID, b.ID},
-	} {
-		var out errBody
-		code := reqJSON(t, srv, http.MethodPut, "/api/bookmarks/order",
-			map[string][]int64{"ids": ids}, &out)
-		if code != http.StatusBadRequest {
-			t.Errorf("%s: %d, want 400", name, code)
-		}
-		if out.Error == "" {
-			t.Errorf("%s: no error message", name)
-		}
-		if out.Code != codeInvalidOrder {
-			t.Errorf("%s: code %q, want %q", name, out.Code, codeInvalidOrder)
+	// Index past the page's end clamps to its tail, not an error.
+	postBookmark(t, srv, "d", "https://d.example.com")
+	code = reqJSON(t, srv, http.MethodPost, "/api/bookmarks/move",
+		map[string]any{"id": a.ID, "page": 0, "index": 99}, &list)
+	if code != http.StatusOK {
+		t.Fatalf("clamped move = %d, want 200", code)
+	}
+	if got := bookmarkTitles(list); !slices.Equal(got, []string{"b", "c", "d", "a"}) {
+		t.Fatalf("clamped move response = %v", got)
+	}
+}
+
+// TestMoveCascade: a move into a full page pushes its tail to the front
+// of the next page, end to end.
+func TestMoveCascade(t *testing.T) {
+	srv, st, _ := newTestServer(t)
+	reqJSON(t, srv, http.MethodPut, "/api/settings",
+		map[string]any{"grid": map[string]int{"rows": 3, "cols": 4}}, nil)
+	seed := seedBookmarks(t, st, 25) // cap 12: pages 0,1 full + 1
+
+	var list []store.Bookmark
+	code := reqJSON(t, srv, http.MethodPost, "/api/bookmarks/move",
+		map[string]any{"id": seed[0].ID, "page": 1, "index": 0}, &list)
+	if code != http.StatusOK {
+		t.Fatalf("move = %d, want 200", code)
+	}
+	// b23 spilled to the front of page 2, ahead of b24.
+	want := [][]string{
+		bookmarkTitles(seed[1:12]),
+		append([]string{seed[0].Title}, bookmarkTitles(seed[12:23])...),
+		{seed[23].Title, seed[24].Title},
+	}
+	if got := pageOf(t, list); !samePages(got, want) {
+		t.Fatalf("move response pages = %v, want %v", got, want)
+	}
+	if got := listPages(t, srv); !samePages(got, want) {
+		t.Fatalf("persisted pages = %v, want %v", got, want)
+	}
+}
+
+// TestMoveNewPage: targeting page == len(pages) lands the bookmark on a
+// new last page.
+func TestMoveNewPage(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	a := postBookmark(t, srv, "a", "https://a.example.com")
+	postBookmark(t, srv, "b", "https://b.example.com")
+
+	var list []store.Bookmark
+	code := reqJSON(t, srv, http.MethodPost, "/api/bookmarks/move",
+		map[string]any{"id": a.ID, "page": 1, "index": 0}, &list)
+	if code != http.StatusOK {
+		t.Fatalf("move = %d, want 200", code)
+	}
+	want := [][]string{{"b"}, {"a"}}
+	if got := pageOf(t, list); !samePages(got, want) {
+		t.Fatalf("move response = %v", got)
+	}
+	if got := listPages(t, srv); !samePages(got, want) {
+		t.Fatalf("persisted pages = %v", got)
+	}
+}
+
+// TestMoveEmptiesPage: moving the last item off a page drops it; the
+// pages after shift down.
+func TestMoveEmptiesPage(t *testing.T) {
+	srv, st, _ := newTestServer(t)
+	reqJSON(t, srv, http.MethodPut, "/api/settings",
+		map[string]any{"grid": map[string]int{"rows": 3, "cols": 4}}, nil)
+	seed := seedBookmarks(t, st, 14) // page 0 (12), page 1 (2)
+
+	// Park b12 on a new page 2, then move the last page-1 item over:
+	// page 1 empties and drops, the parked page becomes page 1.
+	for _, mv := range [][2]int{{12, 2}, {13, 2}} {
+		var list []store.Bookmark
+		code := reqJSON(t, srv, http.MethodPost, "/api/bookmarks/move",
+			map[string]any{"id": seed[mv[0]].ID, "page": mv[1], "index": 0}, &list)
+		if code != http.StatusOK {
+			t.Fatalf("move b%02d = %d, want 200", mv[0], code)
 		}
 	}
-	// Rejected reorders leave the stored order untouched.
-	if got := listTitles(t, srv); !slices.Equal(got, []string{"c", "a", "b"}) {
-		t.Fatalf("order after rejects = %v", got)
+	want := [][]string{
+		bookmarkTitles(seed[:12]),
+		{seed[13].Title, seed[12].Title},
+	}
+	if got := listPages(t, srv); !samePages(got, want) {
+		t.Fatalf("pages = %v, want %v", got, want)
+	}
+}
+
+// TestMoveErrors: a missing id is a 404 not_found; a malformed body, a
+// negative value or a page past the end is a 400 invalid_move — and
+// PUT /api/bookmarks/order is gone.
+func TestMoveErrors(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	a := postBookmark(t, srv, "a", "https://a.example.com")
+
+	var e errBody
+	// A missing bookmark id is a 404, as is id 0 (ids start at 1).
+	for _, id := range []int{0, 999} {
+		e = errBody{}
+		code := reqJSON(t, srv, http.MethodPost, "/api/bookmarks/move",
+			map[string]any{"id": id, "page": 0, "index": 0}, &e)
+		if code != http.StatusNotFound || e.Code != codeNotFound {
+			t.Errorf("id %d: %d %+v, want 404 not_found", id, code, e)
+		}
+	}
+	// Malformed JSON → 400 invalid_move with a friendly message.
+	e = errBody{}
+	if code := reqRaw(t, srv, http.MethodPost, "/api/bookmarks/move", "{oops", &e); code != http.StatusBadRequest {
+		t.Fatalf("bad json = %d, want 400", code)
+	}
+	if e.Code != codeInvalidMove || e.Error == "" {
+		t.Fatalf("bad json body = %+v, want code %q and a message", e, codeInvalidMove)
+	}
+	// Negative values and a page past the end → 400 invalid_move.
+	for name, body := range map[string]any{
+		"negative id":    map[string]any{"id": -1, "page": 0, "index": 0},
+		"negative page":  map[string]any{"id": a.ID, "page": -1, "index": 0},
+		"negative index": map[string]any{"id": a.ID, "page": 0, "index": -1},
+		"page past end":  map[string]any{"id": a.ID, "page": 5, "index": 0},
+	} {
+		e = errBody{}
+		code := reqJSON(t, srv, http.MethodPost, "/api/bookmarks/move", body, &e)
+		if code != http.StatusBadRequest || e.Code != codeInvalidMove || e.Error == "" {
+			t.Errorf("%s: %d %+v, want 400 invalid_move with a message", name, code, e)
+		}
+	}
+	// The board is untouched by all of it.
+	if got := listTitles(t, srv); !slices.Equal(got, []string{"a"}) {
+		t.Fatalf("list after rejected moves = %v", got)
+	}
+
+	// PUT /api/bookmarks/order is gone: the path now parses as
+	// PUT /api/bookmarks/{id} with the non-numeric id "order" → 400.
+	e = errBody{}
+	code := reqJSON(t, srv, http.MethodPut, "/api/bookmarks/order",
+		map[string]any{"ids": []int64{a.ID}}, &e)
+	if code != http.StatusBadRequest || e.Code != codeInvalidID {
+		t.Fatalf("PUT /order = %d %+v, want 400 invalid_id", code, e)
 	}
 }
 
@@ -527,6 +703,12 @@ func TestExportImportRoundtrip(t *testing.T) {
 	if doc.Version != exportVersion || doc.ExportedAt == "" ||
 		len(doc.Bookmarks) != 2 || doc.Settings != want {
 		t.Fatalf("export doc = %s", raw)
+	}
+	// Exported items carry their slot: page + position within the page.
+	for i, nb := range doc.Bookmarks {
+		if nb.Page == nil || *nb.Page != 0 || nb.Position != i {
+			t.Fatalf("export item %d slot = %+v, want page 0 position %d", i, nb, i)
+		}
 	}
 
 	// Replace-import into a fresh instance applies bookmarks and settings.
@@ -721,7 +903,7 @@ func TestImportReplaceSpacingOmitted(t *testing.T) {
 func TestGetIcon(t *testing.T) {
 	srv, st, icons := newTestServer(t)
 	ctx := context.Background()
-	b, err := st.Create(ctx, "a", "https://a.example.com")
+	b, err := st.Create(ctx, "a", "https://a.example.com", 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -797,7 +979,7 @@ func TestGetIconCorruptFile(t *testing.T) {
 	// pending state below is stable.
 
 	ctx := context.Background()
-	b, err := st.Create(ctx, "a", "https://a.example.com")
+	b, err := st.Create(ctx, "a", "https://a.example.com", 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -851,7 +1033,7 @@ func TestGetIconCorruptFile(t *testing.T) {
 func TestIconRefresh(t *testing.T) {
 	srv, st, icons := newTestServer(t)
 	ctx := context.Background()
-	b, err := st.Create(ctx, "a", "https://a.example.com")
+	b, err := st.Create(ctx, "a", "https://a.example.com", 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -933,7 +1115,7 @@ func TestUnknownAPIPath(t *testing.T) {
 		method, path, allow string
 	}{
 		{http.MethodDelete, "/api/settings", "GET, PUT"},
-		{http.MethodGet, "/api/bookmarks/order", "PUT"},
+		{http.MethodGet, "/api/bookmarks/move", "POST"},
 		{http.MethodDelete, "/api/bookmarks", "GET, POST"},
 		{http.MethodGet, "/api/bookmarks/1", "PUT, DELETE"},
 	} {
@@ -1168,5 +1350,208 @@ func TestFavicon(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "<svg") {
 		t.Error("GET /favicon.svg: body is not an SVG")
+	}
+}
+
+// TestCreatePageHint: POST /api/bookmarks accepts an optional "page"
+// hint — the page the user is viewing; the new bookmark lands at the
+// first free slot at or after it.
+func TestCreatePageHint(t *testing.T) {
+	srv, st, _ := newTestServer(t)
+	reqJSON(t, srv, http.MethodPut, "/api/settings",
+		map[string]any{"grid": map[string]int{"rows": 3, "cols": 4}}, nil)
+	seedBookmarks(t, st, 13) // cap 12: page 0 full, page 1 has one
+
+	// Hint to page 1: lands at its free end.
+	var b store.Bookmark
+	code := reqJSON(t, srv, http.MethodPost, "/api/bookmarks",
+		map[string]any{"title": "x", "url": "https://x.example.com", "page": 1}, &b)
+	if code != http.StatusCreated || b.Page != 1 || b.Position != 1 {
+		t.Fatalf("page hint 1 = %d %+v, want 201 slot (1,1)", code, b)
+	}
+	// A negative page is page 0; page 0 is full so it lands on page 1.
+	var b2 store.Bookmark
+	code = reqJSON(t, srv, http.MethodPost, "/api/bookmarks",
+		map[string]any{"title": "y", "url": "https://y.example.com", "page": -3}, &b2)
+	if code != http.StatusCreated || b2.Page != 1 || b2.Position != 2 {
+		t.Fatalf("page hint -3 = %d %+v, want 201 slot (1,2)", code, b2)
+	}
+	// A page past the last means the last page.
+	var b3 store.Bookmark
+	code = reqJSON(t, srv, http.MethodPost, "/api/bookmarks",
+		map[string]any{"title": "z", "url": "https://z.example.com", "page": 99}, &b3)
+	if code != http.StatusCreated || b3.Page != 1 || b3.Position != 3 {
+		t.Fatalf("page hint 99 = %d %+v, want 201 slot (1,3)", code, b3)
+	}
+}
+
+// TestSettingsGridReflow: PUT /api/settings with a changed grid reflows
+// every page inside the same transaction — a shrink pushes overflow
+// forward, a grow is a no-op.
+func TestSettingsGridReflow(t *testing.T) {
+	srv, st, _ := newTestServer(t)
+	seed := seedBookmarks(t, st, 25) // default 4x6 cap 24 → [24],[1]
+
+	// Shrink to 3x5 cap 15.
+	var out store.Settings
+	code := reqJSON(t, srv, http.MethodPut, "/api/settings",
+		map[string]any{"grid": map[string]int{"rows": 3, "cols": 5}}, &out)
+	if code != http.StatusOK {
+		t.Fatalf("put = %d, want 200", code)
+	}
+	want := [][]string{
+		bookmarkTitles(seed[:15]),
+		append(bookmarkTitles(seed[15:24]), seed[24].Title),
+	}
+	if got := listPages(t, srv); !samePages(got, want) {
+		t.Fatalf("after shrink pages = %v, want %v", got, want)
+	}
+
+	// Grow to 5x6 cap 30: no-op, free slots are not back-filled.
+	code = reqJSON(t, srv, http.MethodPut, "/api/settings",
+		map[string]any{"grid": map[string]int{"rows": 5, "cols": 6}}, &out)
+	if code != http.StatusOK {
+		t.Fatalf("grow put = %d, want 200", code)
+	}
+	if got := listPages(t, srv); !samePages(got, want) {
+		t.Fatalf("after grow pages = %v, want %v", got, want)
+	}
+}
+
+// TestImportReplacePageInfo: a file where every item carries a page is
+// imported by (page, position) in file order with pages renumbered 0..
+func TestImportReplacePageInfo(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	var res map[string]int
+	code := reqRaw(t, srv, http.MethodPost, "/api/import?mode=replace",
+		`{"bookmarks":[
+			{"title":"a","url":"https://a.example.com","page":1,"position":0},
+			{"title":"b","url":"https://b.example.com","page":0,"position":1},
+			{"title":"c","url":"https://c.example.com","page":0,"position":0},
+			{"title":"d","url":"https://d.example.com","page":3,"position":0}
+		]}`, &res)
+	if code != http.StatusOK || res["imported"] != 4 {
+		t.Fatalf("import = %d %v, want 200 imported=4", code, res)
+	}
+	// File pages 0,1,3 become board pages 0,1,2; page 0 sorts by
+	// position (c pos 0 before b pos 1).
+	want := [][]string{{"c", "b"}, {"a"}, {"d"}}
+	if got := listPages(t, srv); !samePages(got, want) {
+		t.Fatalf("pages = %v, want %v", got, want)
+	}
+}
+
+// TestImportReplaceMixedPageInfo: an item without a page makes the whole
+// file flat — items fill pages in file order under the current cap.
+func TestImportReplaceMixedPageInfo(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	reqJSON(t, srv, http.MethodPut, "/api/settings",
+		map[string]any{"grid": map[string]int{"rows": 3, "cols": 4}}, nil)
+	var res map[string]int
+	code := reqRaw(t, srv, http.MethodPost, "/api/import?mode=replace",
+		`{"bookmarks":[
+			{"title":"a","url":"https://a.example.com","page":5,"position":0},
+			{"title":"b","url":"https://b.example.com"}
+		]}`, &res)
+	if code != http.StatusOK || res["imported"] != 2 {
+		t.Fatalf("import = %d %v, want 200 imported=2", code, res)
+	}
+	want := [][]string{{"a", "b"}}
+	if got := listPages(t, srv); !samePages(got, want) {
+		t.Fatalf("pages = %v, want %v", got, want)
+	}
+}
+
+// TestImportReplaceAppliesGridFirst: the file's settings land before the
+// bookmarks, so a flat layout is chunked under the NEW grid cap.
+func TestImportReplaceAppliesGridFirst(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	var res map[string]int
+	body := `{"settings":{"grid":{"rows":3,"cols":5}},"bookmarks":[
+		{"title":"a","url":"https://a.example.com"},
+		{"title":"b","url":"https://b.example.com"},
+		{"title":"c","url":"https://c.example.com"},
+		{"title":"d","url":"https://d.example.com"},
+		{"title":"e","url":"https://e.example.com"},
+		{"title":"f","url":"https://f.example.com"},
+		{"title":"g","url":"https://g.example.com"},
+		{"title":"h","url":"https://h.example.com"},
+		{"title":"i","url":"https://i.example.com"},
+		{"title":"j","url":"https://j.example.com"},
+		{"title":"k","url":"https://k.example.com"},
+		{"title":"l","url":"https://l.example.com"},
+		{"title":"m","url":"https://m.example.com"},
+		{"title":"n","url":"https://n.example.com"},
+		{"title":"o","url":"https://o.example.com"},
+		{"title":"p","url":"https://p.example.com"}]}`
+	code := reqRaw(t, srv, http.MethodPost, "/api/import?mode=replace", body, &res)
+	if code != http.StatusOK || res["imported"] != 16 {
+		t.Fatalf("import = %d %v, want 200 imported=16", code, res)
+	}
+	// cap 15 from the file's grid, not the previous 24: [15],[1].
+	var list []store.Bookmark
+	reqJSON(t, srv, http.MethodGet, "/api/bookmarks", nil, &list)
+	if list[14].Page != 0 || list[14].Position != 14 ||
+		list[15].Page != 1 || list[15].Position != 0 {
+		t.Fatalf("slots of last items = (%d,%d), (%d,%d); want (0,14), (1,0)",
+			list[14].Page, list[14].Position, list[15].Page, list[15].Position)
+	}
+}
+
+// TestImportAppendUsesAdd: append-mode items go through Add from page
+// 0 — they fill the earliest free slot, not the board's tail, and any
+// page info in the file is ignored.
+func TestImportAppendUsesAdd(t *testing.T) {
+	srv, st, _ := newTestServer(t)
+	reqJSON(t, srv, http.MethodPut, "/api/settings",
+		map[string]any{"grid": map[string]int{"rows": 3, "cols": 4}}, nil)
+	seed := seedBookmarks(t, st, 12)                   // page 0 full
+	postBookmark(t, srv, "m", "https://m.example.com") // page 1
+
+	// Free a slot on page 0.
+	if _, err := st.Move(context.Background(), seed[0].ID, 1, 1); err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	var res map[string]int
+	code := reqRaw(t, srv, http.MethodPost, "/api/import?mode=append",
+		`{"bookmarks":[{"title":"x","url":"https://x.example.com","page":7,"position":0}]}`, &res)
+	if code != http.StatusOK || res["imported"] != 1 {
+		t.Fatalf("import = %d %v, want 200 imported=1", code, res)
+	}
+	// x lands on page 0's free end — the file's page 7 is ignored.
+	var list []store.Bookmark
+	reqJSON(t, srv, http.MethodGet, "/api/bookmarks", nil, &list)
+	got := pageOf(t, list)
+	want := [][]string{
+		append(bookmarkTitles(seed[1:]), "x"),
+		{"m", seed[0].Title},
+	}
+	if !samePages(got, want) {
+		t.Fatalf("pages = %v, want %v", got, want)
+	}
+}
+
+// TestExportRoundtripPages: export → replace-import restores the exact
+// pages, including a not-full last page.
+func TestExportRoundtripPages(t *testing.T) {
+	srv1, st, _ := newTestServer(t)
+	reqJSON(t, srv1, http.MethodPut, "/api/settings",
+		map[string]any{"grid": map[string]int{"rows": 3, "cols": 4}}, nil)
+	seedBookmarks(t, st, 14) // page 0 (12), page 1 (2)
+	want := listPages(t, srv1)
+
+	resp := do(t, srv1, http.MethodGet, "/api/export", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("export = %d", resp.StatusCode)
+	}
+	raw := readAll(t, resp)
+
+	srv2, _, _ := newTestServer(t)
+	var res map[string]int
+	if code := reqRaw(t, srv2, http.MethodPost, "/api/import?mode=replace", string(raw), &res); code != http.StatusOK {
+		t.Fatalf("import = %d", code)
+	}
+	if got := listPages(t, srv2); !samePages(got, want) {
+		t.Fatalf("roundtrip pages = %v, want %v", got, want)
 	}
 }

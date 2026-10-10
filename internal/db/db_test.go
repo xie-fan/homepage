@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -64,10 +65,12 @@ func TestMigrateFreshDB(t *testing.T) {
 			t.Errorf("table %s missing: %v", table, err)
 		}
 	}
-	var idx string
-	if err := db.QueryRowContext(ctx,
-		`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_bookmarks_position'`).Scan(&idx); err != nil {
-		t.Errorf("index idx_bookmarks_position missing: %v", err)
+	for _, index := range []string{"idx_bookmarks_position", "idx_bookmarks_page_position"} {
+		var idx string
+		if err := db.QueryRowContext(ctx,
+			`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`, index).Scan(&idx); err != nil {
+			t.Errorf("index %s missing: %v", index, err)
+		}
 	}
 
 	// Version 1 recorded exactly once.
@@ -87,8 +90,8 @@ func TestMigrateFreshDB(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate versions: %v", err)
 	}
-	if !slices.Equal(versions, []int{1, 2}) {
-		t.Errorf("schema_migrations versions = %v, want [1 2]", versions)
+	if !slices.Equal(versions, []int{1, 2, 3}) {
+		t.Errorf("schema_migrations versions = %v, want [1 2 3]", versions)
 	}
 }
 
@@ -155,7 +158,7 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := Migrate(ctx, db); err != nil {
 		t.Fatalf("first Migrate: %v", err)
 	}
-	// Second run must be a no-op: still exactly two applied versions.
+	// Second run must be a no-op: still exactly three applied versions.
 	if err := Migrate(ctx, db); err != nil {
 		t.Fatalf("second Migrate: %v", err)
 	}
@@ -163,8 +166,8 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if n != 2 {
-		t.Errorf("schema_migrations rows = %d, want 2", n)
+	if n != 3 {
+		t.Errorf("schema_migrations rows = %d, want 3", n)
 	}
 	// Schema still usable after re-migration.
 	if _, err := db.ExecContext(ctx,
@@ -203,5 +206,98 @@ func TestParseMigrationsBadNames(t *testing.T) {
 		if _, err := parseMigrations(names); err == nil {
 			t.Errorf("parseMigrations(%v) = nil error, want error", names)
 		}
+	}
+}
+
+// TestMigratePages: migration 0003 adds the page column and converts
+// the flat order — row_number over (position, id) − 1 — into
+// page = rank/cap, position = rank%cap, cap from the stored grid
+// (default 4×6 when the setting is absent).
+func TestMigratePages(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		grid      string // stored settings.grid JSON; "" = absent
+		wantPages []int  // bookmarks per converted page
+	}{
+		{"4x6 grid", `{"rows":4,"cols":6}`, []int{24, 3}},
+		{"no grid row defaults to 24", "", []int{24, 3}},
+		{"3x5 grid", `{"rows":3,"cols":5}`, []int{15, 12}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, path := openTest(t)
+			db, err := Open(path)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer db.Close()
+
+			// Recreate a pre-0003 database: schema_migrations plus
+			// versions 1+2 applied by hand so only 0003 is left for
+			// Migrate to run.
+			if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+				version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+				t.Fatalf("create schema_migrations: %v", err)
+			}
+			for _, m := range []migration{
+				{version: 1, name: "0001_init.sql"},
+				{version: 2, name: "0002_spacing_default.sql"},
+			} {
+				if err := apply(ctx, db, m); err != nil {
+					t.Fatalf("apply %s: %v", m.name, err)
+				}
+			}
+			if tc.grid != "" {
+				if _, err := db.ExecContext(ctx,
+					`INSERT INTO settings (key, value) VALUES ('grid', ?)`, tc.grid); err != nil {
+					t.Fatalf("seed grid: %v", err)
+				}
+			}
+			// 27 bookmarks in flat order (position = rank, ids in order).
+			const n = 27
+			for i := 0; i < n; i++ {
+				if _, err := db.ExecContext(ctx,
+					`INSERT INTO bookmarks (title, url, position, created_at, updated_at)
+					 VALUES (?, 'https://example.com', ?, 'now', 'now')`,
+					fmt.Sprintf("b%02d", i), i); err != nil {
+					t.Fatalf("seed bookmark %d: %v", i, err)
+				}
+			}
+
+			if err := Migrate(ctx, db); err != nil {
+				t.Fatalf("Migrate: %v", err)
+			}
+
+			// Order by the new (page, position): ids must come back in
+			// their old flat order, each at the expected slot.
+			rows, err := db.QueryContext(ctx,
+				`SELECT id, page, position FROM bookmarks ORDER BY page, position, id`)
+			if err != nil {
+				t.Fatalf("read bookmarks: %v", err)
+			}
+			defer rows.Close()
+			var got [][3]int64
+			for rows.Next() {
+				var id int64
+				var page, pos int
+				if err := rows.Scan(&id, &page, &pos); err != nil {
+					t.Fatalf("scan: %v", err)
+				}
+				got = append(got, [3]int64{id, int64(page), int64(pos)})
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatalf("iterate: %v", err)
+			}
+			var want [][3]int64
+			id := int64(1)
+			for p, count := range tc.wantPages {
+				for i := 0; i < count; i++ {
+					want = append(want, [3]int64{id, int64(p), int64(i)})
+					id++
+				}
+			}
+			if !slices.Equal(got, want) {
+				t.Errorf("slots = %v, want %v", got, want)
+			}
+		})
 	}
 }

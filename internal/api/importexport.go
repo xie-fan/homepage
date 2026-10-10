@@ -58,7 +58,10 @@ func (s *server) exportBookmarks(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]store.NewBookmark, len(bs))
 	for i, b := range bs {
-		items[i] = store.NewBookmark{Title: b.Title, URL: b.URL}
+		page := b.Page
+		items[i] = store.NewBookmark{
+			Title: b.Title, URL: b.URL, Page: &page, Position: b.Position,
+		}
 	}
 	doc := exportDoc{
 		Version:    exportVersion,
@@ -97,15 +100,18 @@ func (s *server) importBookmarks(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("too many bookmarks: %d (max %d)", len(items), maxImportItems)))
 		return
 	}
-	// Validate everything up front so a bad item rejects the whole import.
-	for i, nb := range items {
-		title, rawURL, verr := validateBookmarkInput(nb.Title, nb.URL)
+	// Validate everything up front so a bad item rejects the whole
+	// import; the normalized values replace the raw ones in place,
+	// keeping any page/position info the file carries.
+	for i := range items {
+		title, rawURL, verr := validateBookmarkInput(items[i].Title, items[i].URL)
 		if verr != nil {
 			writeErr(w, badInput(codeImportInvalid, verr.Field,
 				fmt.Sprintf("bookmarks[%d]: %s", i, verr.Msg)))
 			return
 		}
-		items[i] = store.NewBookmark{Title: title, URL: rawURL}
+		items[i].Title = title
+		items[i].URL = rawURL
 	}
 
 	ctx := r.Context()

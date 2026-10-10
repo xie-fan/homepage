@@ -17,7 +17,7 @@ const (
 	codeDuplicateURL     = "duplicate_url"
 	codeNotFound         = "not_found"
 	codeInvalidID        = "invalid_id"
-	codeInvalidOrder     = "invalid_order"
+	codeInvalidMove      = "invalid_move"
 	codeInvalidGrid      = "invalid_grid"
 	codeInvalidSpacing   = "invalid_spacing"
 	codeImportInvalid    = "import_invalid"

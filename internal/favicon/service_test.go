@@ -114,7 +114,7 @@ func TestServiceEnqueueFetchesIcon(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	b, err := env.st.Create(ctx, "t", env.srv.URL)
+	b, err := env.st.Create(ctx, "t", env.srv.URL, 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestServiceNoIcon(t *testing.T) {
 	if err := env.svc.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	b, err := env.st.Create(ctx, "t", bare.URL)
+	b, err := env.st.Create(ctx, "t", bare.URL, 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestServiceStartRecoversPending(t *testing.T) {
 
 	// Pending rows that exist before Start are picked up automatically —
 	// this is the restart-recovery path.
-	b, err := env.st.Create(ctx, "t", env.srv.URL)
+	b, err := env.st.Create(ctx, "t", env.srv.URL, 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestServiceBlockedPrivateRecordsError(t *testing.T) {
 	if err := env.svc.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	b, err := env.st.Create(ctx, "t", env.srv.URL)
+	b, err := env.st.Create(ctx, "t", env.srv.URL, 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestServiceSkipsStaleJob(t *testing.T) {
 	if err := env.svc.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	b, err := env.st.Create(ctx, "t", env.srv.URL)
+	b, err := env.st.Create(ctx, "t", env.srv.URL, 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestServiceSameHostSingleFetch(t *testing.T) {
 	}
 	var ids []int64
 	for i := 0; i < 3; i++ {
-		b, err := env.st.Create(ctx, "t", fmt.Sprintf("%s/p%d", src.srv.URL, i))
+		b, err := env.st.Create(ctx, "t", fmt.Sprintf("%s/p%d", src.srv.URL, i), 0)
 		if err != nil {
 			t.Fatalf("Create: %v", err)
 		}
@@ -316,14 +316,14 @@ func TestServiceReusesCachedIcon(t *testing.T) {
 	if err := env.svc.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	b1, err := env.st.Create(ctx, "t", src.srv.URL+"/a")
+	b1, err := env.st.Create(ctx, "t", src.srv.URL+"/a", 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	env.svc.Enqueue(b1.ID, b1.URL)
 	b1 = waitStatus(t, env.st.BookmarkStore, b1.ID, store.IconOK)
 
-	b2, err := env.st.Create(ctx, "t", src.srv.URL+"/b")
+	b2, err := env.st.Create(ctx, "t", src.srv.URL+"/b", 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -365,11 +365,11 @@ func TestServiceDifferentHostsSeparateIcons(t *testing.T) {
 	if err := env.svc.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	b1, err := env.st.Create(ctx, "t", src.srv.URL)
+	b1, err := env.st.Create(ctx, "t", src.srv.URL, 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	b2, err := env.st.Create(ctx, "t", localURL)
+	b2, err := env.st.Create(ctx, "t", localURL, 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -397,7 +397,7 @@ func TestServiceStaleHostFileRefetches(t *testing.T) {
 	if err := env.svc.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	b1, err := env.st.Create(ctx, "t", src.srv.URL+"/a")
+	b1, err := env.st.Create(ctx, "t", src.srv.URL+"/a", 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -410,7 +410,7 @@ func TestServiceStaleHostFileRefetches(t *testing.T) {
 		t.Fatalf("Chtimes: %v", err)
 	}
 
-	b2, err := env.st.Create(ctx, "t", src.srv.URL+"/b")
+	b2, err := env.st.Create(ctx, "t", src.srv.URL+"/b", 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestServiceInvalidCachedIconNotReused(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	b, err := env.st.Create(ctx, "t", src.srv.URL+"/a")
+	b, err := env.st.Create(ctx, "t", src.srv.URL+"/a", 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -475,7 +475,7 @@ func TestServiceIconFileDropsCorrupt(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	b, err := env.st.Create(ctx, "t", env.srv.URL)
+	b, err := env.st.Create(ctx, "t", env.srv.URL, 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -522,7 +522,7 @@ func TestServiceMissingHostFileRefetches(t *testing.T) {
 	if err := env.svc.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	b1, err := env.st.Create(ctx, "t", src.srv.URL+"/a")
+	b1, err := env.st.Create(ctx, "t", src.srv.URL+"/a", 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -532,7 +532,7 @@ func TestServiceMissingHostFileRefetches(t *testing.T) {
 		t.Fatalf("Remove: %v", err)
 	}
 
-	b2, err := env.st.Create(ctx, "t", src.srv.URL+"/b")
+	b2, err := env.st.Create(ctx, "t", src.srv.URL+"/b", 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -556,7 +556,7 @@ func TestServiceAdoptsHostFileAfterReplace(t *testing.T) {
 	if err := env.svc.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	b1, err := env.st.Create(ctx, "t", src.srv.URL+"/a")
+	b1, err := env.st.Create(ctx, "t", src.srv.URL+"/a", 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -600,7 +600,7 @@ func TestServiceRefreshSoleBookmarkRefetches(t *testing.T) {
 	if err := env.svc.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	b, err := env.st.Create(ctx, "t", src.srv.URL)
+	b, err := env.st.Create(ctx, "t", src.srv.URL, 0)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

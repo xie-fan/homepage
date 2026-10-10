@@ -7,10 +7,12 @@ import (
 )
 
 // bookmarkIn is the JSON body for create and update:
-// {title, url, allow_duplicate?}.
+// {title, url, page?, allow_duplicate?}. page (create only) is the page
+// the user is viewing — the Add hint; it is ignored on update.
 type bookmarkIn struct {
 	Title          string `json:"title"`
 	URL            string `json:"url"`
+	Page           *int   `json:"page"`
 	AllowDuplicate bool   `json:"allow_duplicate"`
 }
 
@@ -37,7 +39,11 @@ func (s *server) createBookmark(w http.ResponseWriter, r *http.Request) {
 	if s.rejectDuplicate(w, r, rawURL, 0, in.AllowDuplicate) {
 		return
 	}
-	b, err := s.store.Create(r.Context(), title, rawURL)
+	fromPage := 0
+	if in.Page != nil {
+		fromPage = *in.Page
+	}
+	b, err := s.store.Create(r.Context(), title, rawURL, fromPage)
 	if err != nil {
 		s.handleErr(w, r, err)
 		return
@@ -124,22 +130,36 @@ func (s *server) deleteBookmark(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// reorderBookmarks applies a full new order: ids must be a permutation of
-// every existing bookmark id (enforced by the store). The response is the
-// reordered list.
-func (s *server) reorderBookmarks(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		IDs []int64 `json:"ids"`
-	}
+// moveIn is the POST /api/bookmarks/move body: relocate bookmark id to
+// slot index of page (page may name a new last page).
+type moveIn struct {
+	ID    int64 `json:"id"`
+	Page  int   `json:"page"`
+	Index int   `json:"index"`
+}
+
+// moveBookmark applies a layout.Insert inside one transaction and
+// answers 200 with the full bookmark list, same as GET /api/bookmarks —
+// the frontend adopts the server's result verbatim.
+func (s *server) moveBookmark(w http.ResponseWriter, r *http.Request) {
+	var in moveIn
 	if aerr := decodeJSON(w, r, &in, maxBody); aerr != nil {
-		writeErr(w, aerr)
+		writeErr(w, badInput(codeInvalidMove, "",
+			`expected a JSON body {"id":N,"page":P,"index":I}`))
 		return
 	}
-	if err := s.store.Reorder(r.Context(), in.IDs); err != nil {
-		s.handleErr(w, r, err)
+	switch {
+	case in.ID < 0:
+		writeErr(w, badInput(codeInvalidMove, "id", "id must not be negative"))
+		return
+	case in.Page < 0:
+		writeErr(w, badInput(codeInvalidMove, "page", "page must not be negative"))
+		return
+	case in.Index < 0:
+		writeErr(w, badInput(codeInvalidMove, "index", "index must not be negative"))
 		return
 	}
-	bs, err := s.store.List(r.Context())
+	bs, err := s.store.Move(r.Context(), in.ID, in.Page, in.Index)
 	if err != nil {
 		s.handleErr(w, r, err)
 		return

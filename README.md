@@ -80,17 +80,17 @@ docker run --rm -v homepage-data:/data -v "$PWD":/backup \
 | method | path | 说明 |
 |---|---|---|
 | GET | `/api/health` | `{"ok":true}` |
-| GET | `/api/bookmarks` | 按 position 列出全部书签 |
-| POST | `/api/bookmarks` | `{title,url}` → 201；追加到末尾，图标异步抓取 |
+| GET | `/api/bookmarks` | 按 `page, position`（页号 + 页内序号）列出全部书签 |
+| POST | `/api/bookmarks` | `{title,url,page?,allow_duplicate?}` → 201；放入 `page`（默认 0）起第一个空位，图标异步抓取 |
+| POST | `/api/bookmarks/move` | `{"id,"page,"index"}` → 200 全量列表；满页尾部顺移溢出，`page` 可为末尾新页 |
 | PUT | `/api/bookmarks/{id}` | `{title,url}`；URL 变更会重新抓图标 |
-| DELETE | `/api/bookmarks/{id}` | 204 |
-| PUT | `/api/bookmarks/order` | `{"ids":[...]}` 全量排序 → position 0..n-1 |
+| DELETE | `/api/bookmarks/{id}` | 204；该页空位收紧、空页移除 |
 | POST | `/api/bookmarks/{id}/icon/refresh` | 重新抓取图标 |
 | GET | `/api/icons/{id}` | 图标字节（缓存文件），无则 404 |
-| GET | `/api/settings` | `{"grid":{"rows":4,"cols":6}}` |
-| PUT | `/api/settings` | 同上结构，带校验 |
-| GET | `/api/export` | `{"version":1,"settings":{...},"bookmarks":[...]}` 下载 |
-| POST | `/api/import?mode=append\|replace` | 同导出结构；图标异步抓取 |
+| GET | `/api/settings` | `{"grid":{"rows":4,"cols":6},"spacing":"normal"}` |
+| PUT | `/api/settings` | 同上结构（部分更新）；grid 变更在同一事务内顺移溢出（缩小）/保持不变（放大） |
+| GET | `/api/export` | `{"version":1,"settings":{...},"bookmarks":[{title,url,page,position},...]}` 下载 |
+| POST | `/api/import?mode=append\|replace` | 同导出结构；replace 全带 `page` 按页复原（缺则按文件顺序平铺，先套用文件内 grid），append 逐项从第 0 页找空位；图标异步抓取 |
 
 校验：title 1–200 字符（trim，空则取 host）；URL 须为绝对 `http`/`https` 且 ≤ 2048 字符。错误返回 `{"error":"..."}`，状态码 400/404/500。
 

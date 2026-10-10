@@ -75,9 +75,7 @@ func NewServer(deps Deps) http.Handler {
 	route("POST /api/bookmarks", s.createBookmark)
 	route("PUT /api/bookmarks/{id}", s.updateBookmark)
 	route("DELETE /api/bookmarks/{id}", s.deleteBookmark)
-	// For PUT /api/bookmarks/order the mux prefers this literal pattern
-	// over PUT /api/bookmarks/{id} (verified by TestReorder).
-	route("PUT /api/bookmarks/order", s.reorderBookmarks)
+	route("POST /api/bookmarks/move", s.moveBookmark)
 	route("POST /api/bookmarks/{id}/icon/refresh", s.refreshIcon)
 	route("GET /api/icons/{id}", s.getIcon)
 	route("GET /api/settings", s.getSettings)
@@ -234,14 +232,14 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // handleErr maps domain errors to responses: ErrNotFound → 404,
-// ErrInvalidOrder → 400 (the wrapped detail is safe to show), anything
+// ErrInvalidMove → 400 (the wrapped detail is safe to show), anything
 // else → 500 with details logged server-side only.
 func (s *server) handleErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, errNotFound)
-	case errors.Is(err, store.ErrInvalidOrder):
-		writeErr(w, badInput(codeInvalidOrder, "ids", err.Error()))
+	case errors.Is(err, store.ErrInvalidMove):
+		writeErr(w, badInput(codeInvalidMove, "", err.Error()))
 	default:
 		s.logger.Error("request failed",
 			"method", r.Method, "path", r.URL.Path, "err", err)

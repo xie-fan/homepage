@@ -11,11 +11,13 @@ import (
 )
 
 // Bookmark is one tile on the homepage grid: a titled link plus its
-// cached favicon state.
+// cached favicon state. Page (0-based) and Position (0-based within the
+// page) give its slot on the board.
 type Bookmark struct {
 	ID         int64     `json:"id"`
 	Title      string    `json:"title"`
 	URL        string    `json:"url"`
+	Page       int       `json:"page"`
 	Position   int       `json:"position"`
 	IconPath   string    `json:"icon_path"`   // file name inside the icons dir; "" when unset
 	IconStatus string    `json:"icon_status"` // one of the Icon* constants below
@@ -31,19 +33,24 @@ const (
 	IconError   = "error"   // last fetch failed
 )
 
-// NewBookmark is the input for creating a bookmark; the store assigns
-// the id, position and icon state.
+// NewBookmark is the input for creating or importing a bookmark; the
+// store assigns the id and icon state. Page/Position carry the layout
+// info an export file may hold: a non-nil Page places the bookmark on
+// its recorded page on a replace import; nil means "no page info".
 type NewBookmark struct {
-	Title string `json:"title"`
-	URL   string `json:"url"`
+	Title    string `json:"title"`
+	URL      string `json:"url"`
+	Page     *int   `json:"page,omitempty"`
+	Position int    `json:"position"`
 }
 
 // ErrNotFound is returned (wrapped) when a bookmark id does not exist.
 var ErrNotFound = errors.New("not found")
 
-// ErrInvalidOrder is returned (wrapped) by Reorder when ids is not a
-// permutation of all existing bookmark ids.
-var ErrInvalidOrder = errors.New("invalid order")
+// ErrInvalidMove is returned (wrapped) by Move when the target slot is
+// not reachable: a negative page or index, or a page beyond
+// 0..len(pages) (len itself means a new last page).
+var ErrInvalidMove = errors.New("invalid move")
 
 // Grid is the page layout: Rows x Cols tiles per page.
 type Grid struct {
@@ -107,29 +114,37 @@ func (s Settings) Validate() error {
 }
 
 // BookmarkStore is the persistence contract for bookmarks. Mutating
-// methods keep positions compact (0..n-1) and run in one transaction.
+// methods apply the internal/layout rules — independent pages of at
+// most grid.rows*cols slots, compacted per page — inside one
+// transaction.
 type BookmarkStore interface {
-	// List returns all bookmarks ordered by position, then id.
+	// List returns all bookmarks ordered by page, then position.
 	List(ctx context.Context) ([]Bookmark, error)
 	// Get returns one bookmark, or ErrNotFound.
 	Get(ctx context.Context, id int64) (Bookmark, error)
-	// Create appends a bookmark after the current last position with a
-	// pending icon.
-	Create(ctx context.Context, title, url string) (Bookmark, error)
+	// Create adds a bookmark with a pending icon via layout.Add: the
+	// first page at or after fromPage with a free slot gets it, or a
+	// new last page when all pages from fromPage on are full.
+	Create(ctx context.Context, title, url string, fromPage int) (Bookmark, error)
 	// Update edits title and URL. A changed URL resets the cached icon to
 	// pending so it gets refetched.
 	Update(ctx context.Context, id int64, title, url string) (Bookmark, error)
-	// Delete removes a bookmark and compacts the remaining positions.
+	// Delete removes a bookmark via layout.Remove: its page closes up
+	// and drops out when left empty.
 	Delete(ctx context.Context, id int64) error
-	// Reorder assigns positions 0..n-1 following ids, which must be a
-	// permutation of every existing id (else ErrInvalidOrder).
-	Reorder(ctx context.Context, ids []int64) error
+	// Move relocates a bookmark via layout.Insert and returns the full
+	// list in display order. page may be len(pages) — a new last page —
+	// and index clamps to the target page's end; anything else out of
+	// range is ErrInvalidMove, a missing id ErrNotFound.
+	Move(ctx context.Context, id int64, page, index int) ([]Bookmark, error)
 	// SetIcon records the icon file name and status for a bookmark.
 	SetIcon(ctx context.Context, id int64, path, status string) error
-	// ReplaceAll deletes all bookmarks then inserts items in order; the
-	// import "replace" mode.
+	// ReplaceAll deletes all bookmarks then inserts items; the import
+	// "replace" mode. When every item carries a Page, items are grouped
+	// by (page, position) — pages renumbered 0.. — and reflowed under
+	// the current grid cap; otherwise items fill pages in file order.
 	ReplaceAll(ctx context.Context, items []NewBookmark) ([]Bookmark, error)
-	// AppendMany inserts items after the current last position; the
+	// AppendMany inserts items via layout.Add from page 0 each; the
 	// import "append" mode.
 	AppendMany(ctx context.Context, items []NewBookmark) ([]Bookmark, error)
 }
