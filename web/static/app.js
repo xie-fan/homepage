@@ -1032,19 +1032,41 @@ export function registerSearch(hooks) { searchHooks = hooks; }
 
 export function isFiltering() { return state.query !== ''; }
 
-// Case-insensitive substring match on title, URL and host; the host also
-// matches after dropping a leading "www.".
-function matchesQuery(b, q) {
-  if ((b.title || '').toLowerCase().includes(q) ||
-      (b.url || '').toLowerCase().includes(q)) return true;
-  const host = hostOf(b.url).toLowerCase();
-  return host.includes(q) || host.replace(/^www\./, '').includes(q);
+// Search matches the bookmark NAME and the URL HOST only: host is the
+// URL's hostname, lowercased, minus a leading "www." — no scheme, port,
+// path or query (matching the whole URL made 't' hit every https
+// bookmark).
+function searchHost(url) {
+  try {
+    return new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+// matchRank scores a bookmark against the (lowercased) query:
+// name-prefix > host-prefix > name-substring > host-substring, -1 = no
+// match. Equal ranks keep the original bookmark order (stable sort).
+function matchRank(b, q) {
+  const name = (b.title || '').toLowerCase();
+  const host = searchHost(b.url);
+  if (name.startsWith(q)) return 0;
+  if (host.startsWith(q)) return 1;
+  if (name.includes(q)) return 2;
+  if (host.includes(q)) return 3;
+  return -1;
 }
 
 export function visibleBookmarks() {
   if (!isFiltering()) return state.bookmarks;
   const q = state.query.toLowerCase();
-  return state.bookmarks.filter((b) => matchesQuery(b, q));
+  const hits = [];
+  for (const b of state.bookmarks) {
+    const rank = matchRank(b, q);
+    if (rank >= 0) hits.push([rank, b]);
+  }
+  hits.sort((a, b) => a[0] - b[0]); // stable: ties keep list order
+  return hits.map(([, b]) => b);
 }
 
 // A tile drag is running (or fully owned by dnd.js): used by search.js to

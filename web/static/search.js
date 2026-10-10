@@ -116,26 +116,49 @@ function clearSearch() {
   input.blur();
 }
 
+// isPrintable: one code point that produces visible text. Control and
+// format chars (Cc/Cf — '\u0000' included) are rejected: they can be the
+// phantom head of a text sequence, never text themselves.
+const isPrintable = (ch) => !/[\p{Cc}\p{Cf}]/u.test(ch);
+
 // Manual text insertion for the type-to-search handoff: the keydown's own
 // default action is prevented (focusing alone is not reliable across
-// browsers), so the character is spliced in at the caret like a keystroke.
+// browsers), so the character is spliced in at the caret like a keystroke
+// and a synthetic input event is dispatched so filtering — and anything
+// else listening — sees it exactly like typed text.
 function insertAtCaret(ch) {
   const s = input.selectionStart ?? input.value.length;
   const end = input.selectionEnd ?? s;
   input.value = input.value.slice(0, s) + ch + input.value.slice(end);
   input.setSelectionRange(s + ch.length, s + ch.length);
-  applyQuery();
+  input.dispatchEvent(new Event('input', { bubbles: true }));
 }
+
+// Double-insert guard: a browser that ignores the keydown's preventDefault
+// may still dispatch the same keystroke's keypress/beforeinput — since the
+// char was already inserted manually, those must be eaten or the first
+// char doubles. guardChar holds the inserted char while it is armed; it
+// ends on the next keydown (both handlers clear it) or on an unrelated
+// keypress/beforeinput — a keystroke's own trailing events always run
+// before any of those.
+let guardChar = '';
 
 // Document keydown (capture phase, so it runs before app.js's handler):
 // type-to-search and the filtering Escape live here. Skips whenever a
 // modal is open, a tile drag is active, or focus already sits in an
 // editable element.
 function onTypeToSearch(e) {
+  guardChar = ''; // a fresh keydown ends the previous keystroke's guard
   if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
   const t = e.target;
   if (t === input) return; // the box's own keydown handler manages it
   if (modalOpen() || isTileDragActive() || isEditable(t)) return;
+  // IME composition or a dead-key sequence wants a text field — hand it
+  // the search box without preventDefault so the sequence continues there.
+  if (e.key === 'Process' || e.keyCode === 229 || e.isComposing || e.key === 'Dead') {
+    input.focus();
+    return;
+  }
   if (e.key === 'Escape') {
     if (isFiltering()) {
       e.preventDefault();
@@ -143,28 +166,43 @@ function onTypeToSearch(e) {
     }
     return;
   }
-  // IME composition or a dead-key sequence wants a text field — hand it
-  // the search box without preventDefault so the sequence continues there.
-  if (e.key === 'Process' || e.keyCode === 229 || e.key === 'Dead') {
+  if (typeof e.key !== 'string' || [...e.key].length !== 1) return; // a named key, not a character
+  if (!isPrintable(e.key)) {
+    // A lone control code point can still be text-bearing: some platforms
+    // report a CJK char's keydown as '\u0000' and deliver the real char
+    // through the keypress/beforeinput that follows. Aim the box at that
+    // flow instead of eating it — never insert the control char itself.
     input.focus();
     return;
   }
-  if (e.key.length !== 1) return; // not a printable character
   e.preventDefault();
   input.focus();
+  guardChar = e.key;
   insertAtCaret(e.key);
 }
 
-// Keys while the box itself is focused: selection navigation and open.
+// Keys while the box itself is focused: selection navigation and open —
+// or, while the box is empty (normal mode), ←/→ paging exactly like an
+// unfocused press.
 function onInputKeydown(e) {
+  guardChar = ''; // a fresh keydown ends the previous keystroke's guard
   if (e.isComposing) return; // the IME owns keys mid-composition
   if (e.key === 'Escape') {
     e.preventDefault();
     clearSearch();
     return;
   }
+  if (!isFiltering()) {
+    // Empty box: the caret has nowhere to go, so ←/→ page the grid like
+    // normal mode instead of doing nothing.
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      goToPage(state.page + (e.key === 'ArrowLeft' ? -1 : 1));
+    }
+    return;
+  }
   const n = visibleBookmarks().length;
-  if (!isFiltering() || n === 0) return; // plain caret/Tab/Enter behaviour
+  if (n === 0) return; // no results: plain caret/Tab/Enter behaviour
   switch (e.key) {
     case 'ArrowRight': e.preventDefault(); move(1); break;
     case 'ArrowLeft': e.preventDefault(); move(-1); break;
@@ -181,6 +219,39 @@ input.addEventListener('input', (e) => {
 });
 input.addEventListener('compositionend', () => applyQuery());
 input.addEventListener('keydown', onInputKeydown);
+// Guarded-keystroke leftovers: a UA that ignored the prevented keydown
+// still sends its keypress/beforeinput — eat the match so the manually
+// inserted char cannot double (see guardChar above). A non-matching event
+// means a new sequence started, so the guard is simply dropped.
+input.addEventListener('keypress', (e) => {
+  if (guardChar) {
+    if (e.key === guardChar) {
+      e.preventDefault();
+      return;
+    }
+    guardChar = '';
+  }
+  // Same "unmappable key" situation as the beforeinput filter below: a
+  // control char is never a keystroke's text.
+  if (typeof e.key === 'string' && [...e.key].length === 1 && !isPrintable(e.key)) {
+    e.preventDefault();
+  }
+});
+input.addEventListener('beforeinput', (e) => {
+  if (guardChar) {
+    if (e.inputType === 'insertText' && e.data === guardChar) {
+      e.preventDefault();
+      return;
+    }
+    guardChar = '';
+  }
+  // NUL/control text never reaches the box: a platform that cannot map a
+  // key may commit '\u0000' as the keystroke's "text".
+  if (e.inputType === 'insertText' &&
+      typeof e.data === 'string' && /[\p{Cc}\p{Cf}]/u.test(e.data)) {
+    e.preventDefault();
+  }
+});
 document.addEventListener('keydown', onTypeToSearch, true);
 // A composition starting while nothing editable is focused (IMEs that
 // don't go through the Process keydown): aim it at the search box.
