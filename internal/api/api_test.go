@@ -604,3 +604,60 @@ func TestIconRefresh(t *testing.T) {
 		t.Fatalf("stored = %+v, %v", got, err)
 	}
 }
+
+func TestStaticUI(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+
+	resp := do(t, srv, http.MethodGet, "/", nil)
+	body := readAll(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /: status %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("GET /: Content-Type = %q, want text/html", ct)
+	}
+	if !strings.Contains(string(body), `id="app"`) {
+		t.Error(`GET /: body missing id="app" app root`)
+	}
+}
+
+func TestStaticAssets(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+
+	for _, path := range []string{"/app.js", "/api.js", "/style.css"} {
+		resp := do(t, srv, http.MethodGet, path, nil)
+		_ = readAll(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s: status %d, want 200", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestUnknownAPIPath(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+
+	// Unknown /api paths get a JSON 404 for every method, never the file
+	// server's plain-text response.
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		var out map[string]string
+		code := reqJSON(t, srv, method, "/api/no-such-route", nil, &out)
+		if code != http.StatusNotFound {
+			t.Errorf("%s /api/no-such-route: status %d, want 404", method, code)
+		}
+		if out["error"] == "" {
+			t.Errorf("%s /api/no-such-route: body %v has no error", method, out)
+		}
+	}
+
+	var out map[string]string
+	if code := reqJSON(t, srv, http.MethodGet, "/api", nil, &out); code != http.StatusNotFound {
+		t.Errorf("GET /api: status %d, want 404", code)
+	}
+
+	// A non-GET method on a static path is a 405, not a file response.
+	resp := do(t, srv, http.MethodPost, "/", nil)
+	_ = readAll(t, resp)
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("POST /: status %d, want 405", resp.StatusCode)
+	}
+}

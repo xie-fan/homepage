@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
 
 	"homepage/internal/store"
+	"homepage/web"
 )
 
 // Request body limits: bookmark/settings payloads are tiny, imports may
@@ -25,6 +27,9 @@ type Deps struct {
 	Store  *store.Store
 	Icons  IconService
 	Logger *slog.Logger
+	// Static is the UI file system served for non-/api GET paths; nil
+	// falls back to the embedded assets in homepage/web.
+	Static fs.FS
 }
 
 // server is the unexported handler implementation behind NewServer.
@@ -32,6 +37,7 @@ type server struct {
 	store  *store.Store
 	icons  IconService
 	logger *slog.Logger
+	static http.Handler // file server for the embedded UI
 }
 
 // NewServer builds the API handler: all routes plus logging and recover
@@ -61,9 +67,40 @@ func NewServer(deps Deps) http.Handler {
 	mux.HandleFunc("GET /api/export", s.exportBookmarks)
 	mux.HandleFunc("POST /api/import", s.importBookmarks)
 
+	// Unmatched /api paths (any method) get a JSON 404 instead of the file
+	// server's plain-text one. More specific API patterns win over these.
+	mux.HandleFunc("/api", s.unknownAPI)
+	mux.HandleFunc("/api/", s.unknownAPI)
+
+	static := deps.Static
+	if static == nil {
+		static = web.Static()
+	}
+	s.static = http.FileServer(http.FS(static))
+	// The bare "/" pattern also covers /api/* paths, but the more specific
+	// API and /api catch-all patterns win for those.
+	mux.HandleFunc("/", s.serveStatic)
+
 	// recover sits inside the logger so a panicking handler still produces
 	// a logged 500 response.
 	return s.logRequests(s.recover(mux))
+}
+
+// unknownAPI is the catch-all for /api paths without a route.
+func (s *server) unknownAPI(w http.ResponseWriter, _ *http.Request) {
+	writeError(w, http.StatusNotFound, "not found")
+}
+
+// serveStatic serves the embedded UI for every non-/api GET path — the
+// file server maps "/" to index.html itself. Other methods get a 405
+// rather than a file response.
+func (s *server) serveStatic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.static.ServeHTTP(w, r)
 }
 
 func (s *server) health(w http.ResponseWriter, _ *http.Request) {

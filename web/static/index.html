@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Homepage</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1 class="topbar-title">Homepage</h1>
+    <div class="topbar-actions">
+      <button id="btn-add" class="btn" type="button">+ 添加</button>
+      <button id="btn-settings" class="btn btn-icon" type="button" aria-label="设置" title="设置">⚙</button>
+    </div>
+  </header>
+
+  <main id="app">
+    <div id="viewport" class="viewport">
+      <div id="track" class="track"></div>
+    </div>
+    <button id="nav-prev" class="nav-arrow nav-prev" type="button" aria-label="上一页">‹</button>
+    <button id="nav-next" class="nav-arrow nav-next" type="button" aria-label="下一页">›</button>
+    <div id="dots" class="dots"></div>
+  </main>
+
+  <div id="modal-bookmark" class="modal-backdrop" hidden>
+    <form id="form-bookmark" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-bookmark-title">
+      <h2 id="modal-bookmark-title">添加书签</h2>
+      <label class="field">
+        <span>名称</span>
+        <input id="bm-title" type="text" maxlength="200" autocomplete="off">
+      </label>
+      <label class="field">
+        <span>网址</span>
+        <input id="bm-url" type="text" inputmode="url" placeholder="example.com" autocomplete="off" required>
+      </label>
+      <p id="bm-error" class="modal-msg error" hidden></p>
+      <div class="modal-actions">
+        <button id="bm-delete" class="btn btn-danger" type="button" hidden>删除</button>
+        <button id="bm-refresh" class="btn" type="button" hidden>刷新图标</button>
+        <span class="spacer"></span>
+        <button id="bm-cancel" class="btn" type="button">取消</button>
+        <button class="btn btn-primary" type="submit">保存</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="modal-settings" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-settings-title">
+      <h2 id="modal-settings-title">设置</h2>
+      <div class="field-row">
+        <label class="field">
+          <span>行数</span>
+          <select id="set-rows">
+            <option value="3">3</option>
+            <option value="4">4</option>
+            <option value="5">5</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>列数</span>
+          <select id="set-cols">
+            <option value="4">4</option>
+            <option value="5">5</option>
+            <option value="6">6</option>
+          </select>
+        </label>
+      </div>
+      <div class="field">
+        <span>数据</span>
+        <div class="row">
+          <button id="btn-export" class="btn" type="button">导出</button>
+        </div>
+        <div class="row">
+          <input id="import-file" type="file" accept=".json,application/json">
+        </div>
+        <div class="row radio-row">
+          <label><input type="radio" name="import-mode" value="append" checked> 追加</label>
+          <label><input type="radio" name="import-mode" value="replace"> 替换</label>
+          <button id="btn-import" class="btn" type="button">导入</button>
+        </div>
+      </div>
+      <p id="set-msg" class="modal-msg" hidden></p>
+      <div class="modal-actions">
+        <button id="set-close" class="btn" type="button">关闭</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
