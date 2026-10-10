@@ -138,3 +138,59 @@ multicast/CGNAT IPs (after DNS resolution, so redirects + rebinding are covered)
 8. **Docker**: multi-stage Dockerfile (CGO off, non-root, distroless/alpine), `.dockerignore`,
    `docker-compose.yml` (port `${HOMEPAGE_PORT:-8080}`, `./data:/data`), README.
 9. **Final verification**: `go test ./...`, manual curl run, screenshots, zip.
+
+---
+
+## Round 8 — independent pages (replaces "one flat list split into pages")
+
+### Model
+Each bookmark has `page` (0-based) and `position` (0-based within the page). Capacity `cap = rows*cols`.
+A page holds ≤ cap bookmarks, may have free slots at its end, never has holes in the middle
+(positions are compacted 0..n-1 within the page). Pages are numbered 0..P-1 with no empty page,
+except a single empty page 0 when there are no bookmarks.
+
+### Algorithm (package `internal/layout`, mirrored 1:1 in `web/static/layout.js`)
+Layout = `[][]int64` (ids per page, in order). All ops return a new layout.
+- `FromFlat(ids, cap)` — fill pages sequentially (migration, import without page info).
+- `Insert(L, id, page, index, cap)` — remove `id` from its current page (that page closes up,
+  nothing is pulled from the next page); insert into target `page` (page == len(L) means a new
+  page at the end) at `min(index, len(page))`; then `cascade` from the target page; then drop
+  empty pages. Thumbnail drop = Insert with index = len(page).
+- `cascade(L, from, cap)` — for p = from…: while len(L[p]) > cap, pop its last item and push it to
+  the FRONT of L[p+1] (creating a new last page if needed).
+- `Add(L, id, fromPage, cap)` — first page p ≥ fromPage with a free slot gets `id` at its end;
+  if none, a new page is appended. Never pushes others.
+- `Remove(L, id)` — remove, close up within page, drop the page if it became empty (unless only page).
+- `Reflow(L, cap)` — grid change: cascade from page 0 (shrink pushes overflow forward; grow = no-op).
+- `DropEmpty(L)` — remove empty pages, keep at least one.
+
+### API changes
+- Bookmark JSON gains `"page"` and `"position"` (within page). `GET /api/bookmarks` ordered by page, position.
+- `POST /api/bookmarks` accepts optional `"page"` (the page the user is viewing; default 0) → `Add`.
+- `POST /api/bookmarks/move` `{"id":N,"page":P,"index":I}` → applies `Insert` atomically in one tx,
+  returns `200` with the full bookmark list (same shape as GET /api/bookmarks). `page` 0..len(pages)
+  (len = new page), `index` ≥ 0 (clamped). Errors: `not_found`, `invalid_move` (400).
+- `PUT /api/bookmarks/order` removed (frontend no longer uses it).
+- `DELETE /api/bookmarks/{id}` → `Remove`.
+- `PUT /api/settings` with a changed grid → `Reflow` in the same transaction.
+- Export: bookmarks carry `page`, `position`. Import replace: if every item has `page`, group by
+  (page, position) in file order of pages (renumbered 0..), then `Reflow` with the (new) cap; else
+  `FromFlat`. Import append: `Add(…, fromPage=0)` per new (non-duplicate) bookmark.
+- Migration `0003_pages.sql`: add `page`, convert flat order: rank = row_number over (position, id) − 1,
+  page = rank / cap, position = rank % cap, cap from settings.grid (default 4×6).
+
+### Frontend
+- Pages are derived by grouping `state.bookmarks` by `page`; page count = max(page)+1 (≥1).
+- Drag preview = `layout.insert(originalLayout, id, hoverPage, hoverIndex, cap)` recomputed from the
+  drag-start snapshot on every hover change (never cumulative); pointer outside grid/thumbnails →
+  preview shows the original layout (matches cancel on release). Drop → `POST /api/bookmarks/move`,
+  adopt the returned list (server is the source of truth). Hovering an empty slot → index = len(page).
+- Add sends `page: currentPage`; afterwards go to the new bookmark's page and highlight it.
+- Search view unchanged (flat filtered list, drag disabled).
+
+### Tickets
+- P1 (backend): internal/layout + tests; migration 0003; store (page/position, Move/Add/Remove/Reflow
+  in tx, import/export); API (move endpoint, add page hint, settings reflow, remove /order); tests.
+- P2 (frontend, parallel, against the contract above): web/static/layout.js; app.js page grouping,
+  add-with-page; dnd.js snapshot preview + move endpoint + outside-grid revert; thumbs.js drop → move.
+- P3 (reviewer): ui_check.py scenarios, migration check against pre-pages backup, container rebuild.
