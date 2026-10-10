@@ -3,6 +3,7 @@
 // bookmark titles and URLs cannot inject markup.
 
 import { api } from './api.js';
+import { toLayout } from './layout.js';
 
 // ---------- state ----------
 
@@ -60,6 +61,7 @@ const ERROR_MESSAGES = {
   import_too_large: '导入的书签太多（最多 5000 个）',
   not_found: '书签不存在，可能已被删除',
   invalid_order: '排序失败，请刷新后重试',
+  invalid_move: '移动失败，请刷新后重试',
   search_active: '搜索时无法排序',
   internal: '服务器出错了，请稍后重试',
   network: '网络错误，请检查连接',
@@ -90,13 +92,41 @@ function el(tag, className, text) {
 // ---------- geometry ----------
 
 const pageSize = () => state.grid.rows * state.grid.cols;
-const pageCount = () =>
-  Math.max(1, Math.ceil(visibleBookmarks().length / pageSize()));
-// While a tile drag runs on a full last page, dnd.js asks for one extra
-// empty page so an item can be carried "past the end" — a drop there lands
-// at the tail of the flat position list.
-const displayPageCount = () =>
-  pageCount() + (tileDnd && tileDnd.wantsExtraPage() ? 1 : 0);
+
+// displayPages groups the bookmarks into the pages currently rendered —
+// an array of bookmark arrays. In normal mode each bookmark carries its
+// own page/position from the server, so a page is a group-by, NOT a
+// fixed-size slice: it may hold fewer than cap items (free slots at the
+// end). While a tile drag runs, dnd.js supplies a preview layout (arrays
+// of ids) that is rendered instead of the committed one. In filter mode
+// the flat matching subset is still sliced into cap-sized pages (search
+// view unchanged).
+function displayPages() {
+  const preview = tileDnd && tileDnd.previewPages && tileDnd.previewPages();
+  if (preview) {
+    const byId = new Map(state.bookmarks.map((b) => [b.id, b]));
+    return preview.map((ids) => ids.map((id) => byId.get(id)).filter(Boolean));
+  }
+  if (isFiltering()) {
+    const list = visibleBookmarks();
+    const size = pageSize();
+    const out = [];
+    for (let p = 0; p < Math.max(1, Math.ceil(list.length / size)); p++) {
+      out.push(list.slice(p * size, (p + 1) * size));
+    }
+    return out;
+  }
+  const byId = new Map(state.bookmarks.map((b) => [b.id, b]));
+  return toLayout(state.bookmarks)
+    .map((ids) => ids.map((id) => byId.get(id)).filter(Boolean));
+}
+
+const pageCount = () => displayPages().length;
+// While a tile drag runs, dnd.js may ask for one extra empty page at the
+// end — the dashed "+ 新页" drop target (a drop there starts a new page).
+const wantsExtra = () =>
+  Boolean(tileDnd && tileDnd.wantsExtraPage && tileDnd.wantsExtraPage());
+const displayPageCount = () => pageCount() + (wantsExtra() ? 1 : 0);
 const clampPage = () => {
   state.page = Math.min(Math.max(state.page, 0), displayPageCount() - 1);
 };
@@ -225,27 +255,28 @@ function render() {
 
 function renderTrack() {
   els.track.replaceChildren();
-  const size = pageSize();
-  const list = visibleBookmarks();
+  const pages = displayPages();
   for (let p = 0; p < displayPageCount(); p++) {
     const page = el('div', 'page');
     // --cols/--rows feed the repeat()s in style.css; the track sizes
     // (--tile-w/--tile-h) come from layout() so the grid always fits.
     page.style.setProperty('--cols', state.grid.cols);
     page.style.setProperty('--rows', state.grid.rows);
-    const items = list.slice(p * size, (p + 1) * size);
-    if (items.length === 0) {
+    if (p >= pages.length) {
+      // The extra "+ 新页" page shown while a tile drag runs: a dashed
+      // slot marks it as a valid "new page" drop target.
+      page.dataset.extra = '1';
+      page.append(el('div', 'tile drop-slot'));
+    } else if (pages[p].length === 0) {
       if (p === 0) {
         page.append(el('p', 'empty',
           isFiltering() ? '没有匹配的书签'
             : state.loadError ? `加载失败：${state.loadError}` : '还没有书签，点击 + 添加'));
-      } else {
-        // The extra last page shown during a drag on a full grid: a dashed
-        // slot marks it as a valid "new page" drop target.
-        page.append(el('div', 'tile drop-slot'));
       }
+      // A gap page (shouldn't occur — the layout has no empty pages)
+      // renders as bare empty cells either way.
     } else {
-      for (const b of items) page.append(makeTile(b));
+      for (const b of pages[p]) page.append(makeTile(b));
     }
     els.track.append(page);
   }
@@ -768,7 +799,11 @@ async function onBookmarkSubmit(e) {
     if (state.editing) {
       await api.updateBookmark(state.editing.id, title, url, allowDuplicate);
     } else {
-      created = await api.createBookmark(title, url, allowDuplicate);
+      // The page hint is the page the user is viewing: the server adds the
+      // bookmark at the end of the first page with room at or after it.
+      // A filtered view isn't a real page, so it falls back to 0.
+      created = await api.createBookmark(
+        title, url, allowDuplicate, isFiltering() ? 0 : state.page);
     }
     closeModal();
     await refresh();
@@ -792,13 +827,22 @@ async function onBookmarkSubmit(e) {
 }
 
 // revealNewTile flips to the page a just-added bookmark landed on (the
-// server appends it at the tail of the list) and pulses the tile briefly
-// so the eye finds it. The .tile-new ring is CSS (~1.5s); under
+// bookmark's own page field — the server placed it) and pulses the tile
+// briefly so the eye finds it. The .tile-new ring is CSS (~1.5s); under
 // prefers-reduced-motion it shows as a static outline instead.
 function revealNewTile(id) {
-  const index = visibleBookmarks().findIndex((b) => b.id === id);
-  if (index < 0) return;
-  goToPage(Math.floor(index / pageSize()));
+  let page;
+  if (isFiltering()) {
+    // Filtered pages are flat slices, so fall back to the flat index.
+    const i = visibleBookmarks().findIndex((b) => b.id === id);
+    if (i < 0) return;
+    page = Math.floor(i / pageSize());
+  } else {
+    const b = state.bookmarks.find((x) => x.id === id);
+    if (!b) return;
+    page = Number.isInteger(b.page) && b.page > 0 ? b.page : 0;
+  }
+  goToPage(page);
   const tile = els.track.querySelector(`.tile[data-id="${id}"]`);
   if (!tile) return;
   tile.classList.add('tile-new');
@@ -856,7 +900,10 @@ async function onGridChange() {
   const grid = { rows: Number(els.setRows.value), cols: Number(els.setCols.value) };
   try {
     applySettings(await api.putSettings({ grid })); // server echoes stored settings
-    render(); // re-chunk pages under the new grid
+    // A grid change reflows every page server-side — pull the new
+    // page/position values back; render() clamps the current page.
+    state.bookmarks = await api.listBookmarks();
+    render();
   } catch (err) {
     showMsg(els.setMsg, friendlyError(err), true);
   }
@@ -1006,16 +1053,17 @@ async function pollTick() {
 let tileDnd = null;
 export function registerTileDnd(handlers) { tileDnd = handlers; }
 
-// Task 7 hook: persist a new order as the full id list in display order
-// (tiles carry data-id; collect them left-to-right across pages).
-export async function persistOrder(ids) {
-  // Refuse while filtering: dnd would pass the visible (partial) list.
+// Round-8 hook: commit a drag as a single server-side move. The endpoint
+// applies the layout Insert atomically and answers the FULL bookmark
+// list — the server is the source of truth, so we adopt it wholesale.
+export async function commitMove(id, page, index) {
+  // Refuse while filtering: moves only make sense on the full layout.
   if (isFiltering()) {
-    const err = new Error('reorder is disabled while filtering');
+    const err = new Error('move is disabled while filtering');
     err.code = 'search_active';
     throw err;
   }
-  state.bookmarks = await api.reorder(ids);
+  state.bookmarks = await api.moveBookmark(id, page, index);
   render();
 }
 
@@ -1102,7 +1150,7 @@ export function setQuery(q) {
 }
 
 export { state, pageSize, render, goToPage, refresh, showToast, friendlyError,
-  modalOpen, isEditable };
+  modalOpen, isEditable, displayPages };
 
 // ---------- events & boot ----------
 

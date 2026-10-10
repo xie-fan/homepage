@@ -43,10 +43,13 @@ async function request(path, { method = 'GET', body } = {}) {
 
 export const api = {
   listBookmarks: () => request('/api/bookmarks'),
-  createBookmark: (title, url, allowDuplicate = false) =>
+  // page is the layout page the user is viewing (Round 8): the server
+  // uses it as the Add() hint — the bookmark lands at the end of the
+  // first page with a free slot at or after it.
+  createBookmark: (title, url, allowDuplicate = false, page = 0) =>
     request('/api/bookmarks', {
       method: 'POST',
-      body: { title, url, allow_duplicate: allowDuplicate },
+      body: { title, url, allow_duplicate: allowDuplicate, page },
     }),
   updateBookmark: (id, title, url, allowDuplicate = false) =>
     request(`/api/bookmarks/${id}`, {
@@ -54,7 +57,12 @@ export const api = {
       body: { title, url, allow_duplicate: allowDuplicate },
     }),
   deleteBookmark: (id) => request(`/api/bookmarks/${id}`, { method: 'DELETE' }),
-  reorder: (ids) => request('/api/bookmarks/order', { method: 'PUT', body: { ids } }),
+  // Round 8: a drag commits as one server-side move (layout Insert in a
+  // transaction); page 0..len(pages) — len = a new page — and index >= 0
+  // is clamped to the end of the target page. The response is the full
+  // bookmark list, same shape as GET /api/bookmarks.
+  moveBookmark: (id, page, index) =>
+    request('/api/bookmarks/move', { method: 'POST', body: { id, page, index } }),
   refreshIcon: (id) => request(`/api/bookmarks/${id}/icon/refresh`, { method: 'POST' }),
   getSettings: () => request('/api/settings'),
   // patch is a partial settings document, e.g. {grid:{rows,cols}} or

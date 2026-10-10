@@ -2,27 +2,31 @@
 //
 // While dnd.js runs a tile drag this module mounts a fixed strip of mini
 // page previews centered just above the pager dots. Each thumbnail is a
-// shrunken rows×cols grid mirroring the page's tiles: a bookmark with a
-// fetched icon (icon_status 'ok') renders it as a tiny background image,
-// others get a colored dot on the same host-hash palette the tile letter
-// avatars use. The dragged bookmark's live slot keeps a dashed accent
-// mark, and update() re-renders on every live reorder, so the strip
-// always tracks the in-drag order.
+// shrunken rows×cols grid built from the page LAYOUT currently rendered
+// (displayPages() — the live drag preview while dnd.js is active): a
+// bookmark with a fetched icon (icon_status 'ok') renders it as a tiny
+// background image, others get a colored dot on the same host-hash
+// palette the tile letter avatars use. The dragged bookmark's live slot
+// keeps a dashed accent mark, and update() re-renders on every preview
+// change, so the strip always tracks it.
 //
-// Page count mirrors displayPageCount() in app.js: one thumbnail per real
-// page plus — only while the last page is full, the same condition under
-// which dnd.js wantsExtraPage() appends its dashed drop page — a final
-// "+ 新页" thumbnail. (Spec offered "when full or always"; chosen: only
-// when the last page is full, because a new-page target on a non-full
-// last page would land the item on a page that already has a thumbnail.)
+// Page count mirrors the displayed pages: one thumbnail per preview page
+// plus — under the same condition dnd.js wantsExtraPage() appends its
+// dashed drop page (the preview hasn't grown past the committed layout)
+// — a final "+ 新页" thumbnail. With independent pages a new page is
+// always a meaningful drop target: it creates a fresh last page rather
+// than landing on an existing one.
 //
 // Behaviour: parking the pointer ~400ms on a thumbnail flips the main
 // view to that page (one shot per entry) so the tile can be dropped at a
-// precise slot; while a thumb is under the pointer dnd.js disarms both
-// the in-grid reorder and the edge-flip zones. A release over a thumbnail
-// is resolved by dnd.js through dropPage(): the item moves to the END of
-// that page. hide() fades the strip out and clears every timer and the
-// resize hook — the strip itself is hit-tested geometrically through
+// precise slot; while a thumb is under the pointer dnd.js disarms the
+// edge-flip zones and previews the item appended to that page. A release
+// over a thumbnail is resolved by dnd.js through dropPage(): the item
+// moves to the END of that page (index 1e9 — the server clamps it), and
+// a release on "+ 新页" targets page = number of pages. Thumbs report
+// DISPLAYED page indices; dnd.js translates them into layout indices.
+// hide() fades the strip out and clears every timer and the resize hook
+// — the strip itself is hit-tested geometrically through
 // document.elementsFromPoint and has no DOM listeners of its own, so
 // nothing else needs unbinding. Imports stay one-way:
 // dnd.js → thumbs.js → app.js.
@@ -35,7 +39,8 @@
 // (thumbs.css), and thumbAt() skips any stack entry that isn't a thumb
 // even if that ever regresses.
 
-import { state, pageSize, goToPage } from './app.js';
+import { state, pageSize, goToPage, displayPages } from './app.js';
+import { toLayout } from './layout.js';
 
 const HOVER_FLIP_MS = 400; // dwell on a thumbnail before goToPage
 const REMOVE_MS = 240;     // detach after the ~180ms fade (+slack)
@@ -113,29 +118,33 @@ export function hide() {
 
 // ---------- content ----------
 
-// update rebuilds every thumbnail from the live bookmark order and
-// re-marks the current and hovered pages. dnd.js calls it after each
-// in-drag reorder and each page flip.
+// update rebuilds every thumbnail from the page layout currently
+// rendered (displayPages() — the live drag preview) and re-marks the
+// current and hovered pages. dnd.js calls it after each preview change
+// and each page flip.
 export function update() {
   if (!shown || !strip || !strip.isConnected) return;
-  const size = pageSize();
-  const n = state.bookmarks.length;
-  const pages = Math.max(1, Math.ceil(n / size));
-  // Same condition as dnd.js wantsExtraPage(); the extra thumb is the
-  // "+ 新页" drop target.
-  const total = pages + (n > 0 && n % size === 0 ? 1 : 0);
+  const pages = displayPages();
+  // Same condition as dnd.js wantsExtraPage(): the "+ 新页" drop target
+  // exists while the preview hasn't already grown past the committed
+  // layout — once it has, that new page is real and needs no twin.
+  const wantNew = pages.length <= toLayout(state.bookmarks).length;
+  const total = pages.length + (wantNew ? 1 : 0);
   const nodes = [];
-  for (let p = 0; p < total; p++) nodes.push(makeThumb(p, p >= pages, size));
-  // Rebuilding the children resets scrollLeft — keep it so a live reorder
+  for (let p = 0; p < total; p++) nodes.push(makeThumb(p, p >= pages.length, pages));
+  // Rebuilding the children resets scrollLeft — keep it so a live preview
   // doesn't snap a scrolled strip back to the start.
   const sl = strip.scrollLeft;
   strip.replaceChildren(...nodes);
   strip.scrollLeft = sl;
 }
 
-function makeThumb(p, isNew, size) {
+function makeThumb(p, isNew, pages) {
+  const size = pageSize();
   const t = document.createElement('div');
   t.className = 'thumb';
+  // The thumb's DISPLAYED page index — for "+ 新页" that's one past the
+  // last preview page. dnd.js maps it to a layout page for the move.
   t.dataset.page = String(p);
   t.setAttribute('role', 'option');
   t.setAttribute('aria-label', isNew ? '新页' : `第 ${p + 1} 页`);
@@ -159,7 +168,7 @@ function makeThumb(p, isNew, size) {
     plus.textContent = '+';
     g.append(plus);
   } else {
-    const items = state.bookmarks.slice(p * size, (p + 1) * size);
+    const items = pages[p] || [];
     for (let i = 0; i < size; i++) g.append(makeCell(items[i]));
   }
   t.append(g);
