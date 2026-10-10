@@ -131,11 +131,21 @@ const TILE_LABEL = 31;    // link pad-top + gap + one label line (~2+10+19)
 const ICON_MIN = 36;      // mirrors the --icon clamp in style.css
 const ICON_MAX = 72;
 const ICON_RATIO = 0.62;
+// Gaps are ~10% airier than the original presets at every viewport
+// (gapMin/gapMax ×1.1 too). frac/gapShare are calibrated so the
+// reference layout — 1280×800, 4×6, overlay gutters (padX 64) — keeps
+// the tile widths it had before the change while both gaps land ×1.1:
+// F = cols·tileW + (cols−1)·gapX, gapShare chosen so F·gapShare/(cols−1)
+// is exactly 1.1× the old gap.
+//             compact  normal  relaxed
+//   gridW       557px   805px   990px
+//   gapX/gapY   19/19   35/35   48/62px
+//   tileW        77px   105px   125px
 const SPACING = {
-  //           frac  gapShare  gapMin  gapMax  tileMax  rowMul
-  compact:  { frac: 0.43, gapShare: 0.155, gapMin: 10, gapMax: 24, tileMax: 96,  rowMul: 1.0 },
-  normal:   { frac: 0.62, gapShare: 0.200, gapMin: 12, gapMax: 40, tileMax: 106, rowMul: 1.0 },
-  relaxed:  { frac: 0.76, gapShare: 0.226, gapMin: 14, gapMax: 52, tileMax: 126, rowMul: 1.3 },
+  //            frac  gapShare  gapMin  gapMax  tileMax  rowMul
+  compact:  { frac: 0.4366, gapShare: 0.1679, gapMin: 11,   gapMax: 26.4, tileMax: 96,  rowMul: 1.0 },
+  normal:   { frac: 0.6325, gapShare: 0.2157, gapMin: 13.2, gapMax: 44,   tileMax: 106, rowMul: 1.0 },
+  relaxed:  { frac: 0.7772, gapShare: 0.2431, gapMin: 15.4, gapMax: 57.2, tileMax: 126, rowMul: 1.3 },
 };
 const iconFor = (t) => Math.min(ICON_MAX, Math.max(ICON_MIN, t * ICON_RATIO));
 // Least tileH for a tile of width t: the aspect box, or the icon with
