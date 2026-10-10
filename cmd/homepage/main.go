@@ -61,6 +61,7 @@ func run() error {
 		Timeout:      cfg.FaviconTimeout,
 		AllowPrivate: cfg.FaviconAllowPrivate,
 		Fallback:     cfg.FaviconFallback,
+		Proxy:        cfg.FaviconProxy,
 	})
 	icons, err := favicon.NewService(st.BookmarkStore, fetcher, cfg.DataDir, slog.Default())
 	if err != nil {

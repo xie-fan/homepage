@@ -5,6 +5,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"time"
@@ -22,6 +23,11 @@ type Config struct {
 	// FaviconFallback selects an optional third-party icon fallback:
 	// "" (off), "google" or "duckduckgo" (HOMEPAGE_FAVICON_FALLBACK).
 	FaviconFallback string
+	// FaviconProxy is an optional proxy URL for icon fetches; nil means
+	// connect directly (HOMEPAGE_FAVICON_PROXY). With a proxy the SSRF
+	// guard can only vet the proxy's own address — the target host is
+	// resolved and reached by the proxy.
+	FaviconProxy *url.URL
 	// FaviconTimeout is the per-request timeout for icon fetching
 	// (HOMEPAGE_FAVICON_TIMEOUT).
 	FaviconTimeout time.Duration
@@ -61,6 +67,14 @@ func Load() (Config, error) {
 			errs = append(errs, fmt.Errorf("HOMEPAGE_FAVICON_FALLBACK: unsupported value %q (want \"google\" or \"duckduckgo\")", v))
 		}
 	}
+	if v := os.Getenv("HOMEPAGE_FAVICON_PROXY"); v != "" {
+		u, err := url.Parse(v)
+		if err != nil || u.Hostname() == "" || !supportedProxyScheme(u.Scheme) {
+			errs = append(errs, fmt.Errorf("HOMEPAGE_FAVICON_PROXY: invalid proxy URL %q (want http, https, socks5 or socks5h)", v))
+		} else {
+			cfg.FaviconProxy = u
+		}
+	}
 	if v := os.Getenv("HOMEPAGE_FAVICON_TIMEOUT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil || d <= 0 {
@@ -70,4 +84,14 @@ func Load() (Config, error) {
 		}
 	}
 	return cfg, errors.Join(errs...)
+}
+
+// supportedProxyScheme limits proxy URLs to the schemes net/http's
+// Transport can actually speak.
+func supportedProxyScheme(s string) bool {
+	switch s {
+	case "http", "https", "socks5", "socks5h":
+		return true
+	}
+	return false
 }

@@ -1,6 +1,7 @@
 package favicon
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -8,12 +9,33 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"homepage/internal/db"
 	"homepage/internal/store"
 )
+
+// syncBuf is a mutex-guarded buffer so a slog handler on the worker
+// goroutine can be read safely from the test goroutine.
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
 
 // testEnv bundles a Service wired to a real SQLite store and an icon
 // source server, all living in t.TempDir().
@@ -156,6 +178,36 @@ func TestServiceStartRecoversPending(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	waitStatus(t, env.st.BookmarkStore, b.ID, store.IconOK)
+}
+
+func TestServiceBlockedPrivateRecordsError(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	// Swap in a guarding fetcher (AllowPrivate off) so the loopback
+	// httptest target is refused by the SSRF guard, and capture the
+	// worker's logs to check the outcome is explained.
+	env.svc.fetch = New(Options{Timeout: 5 * time.Second})
+	logs := &syncBuf{}
+	env.svc.logger = slog.New(slog.NewTextHandler(logs, nil))
+
+	if err := env.svc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	b, err := env.st.Create(ctx, "t", env.srv.URL)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	env.svc.Enqueue(b.ID, b.URL)
+	waitStatus(t, env.st.BookmarkStore, b.ID, store.IconError)
+
+	// The block is logged at Info with an actionable reason so users
+	// know HOMEPAGE_FAVICON_ALLOW_PRIVATE exists for LAN sites.
+	out := logs.String()
+	if !strings.Contains(out, "level=INFO") ||
+		!strings.Contains(out, "blocked private address") {
+		t.Fatalf("expected Info log \"blocked private address\", got: %s", out)
+	}
 }
 
 func TestServiceSkipsStaleJob(t *testing.T) {

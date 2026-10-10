@@ -181,7 +181,15 @@ func (s *Service) process(id int64, pageURL string) {
 		s.setIcon(id, "", store.IconNone)
 		return
 	case err != nil:
-		s.logger.Warn("icon fetch failed", "id", id, "url", b.URL, "err", err)
+		if errors.Is(err, ErrBlockedIP) {
+			s.logger.Info("icon fetch failed",
+				"id", id, "url", b.URL,
+				"reason", "blocked private address",
+				"hint", "set HOMEPAGE_FAVICON_ALLOW_PRIVATE=true for LAN sites",
+				"err", err)
+		} else {
+			s.logger.Warn("icon fetch failed", "id", id, "url", b.URL, "err", err)
+		}
 		s.setIcon(id, "", store.IconError)
 		return
 	}

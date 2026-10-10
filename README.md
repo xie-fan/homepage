@@ -44,6 +44,7 @@ Dockerfile 和 compose 都**没有**配置 HEALTHCHECK：distroless 镜像里没
 | `HOMEPAGE_DATA_DIR` | `./data`（镜像内 `/data`） | SQLite 数据库与图标缓存目录 |
 | `HOMEPAGE_FAVICON_ALLOW_PRIVATE` | `false` | 允许从内网 / 回环 IP 抓取图标（内网站点需要，见安全说明） |
 | `HOMEPAGE_FAVICON_FALLBACK` | 空（关闭） | 第三方图标兜底服务：`google` 或 `duckduckgo` |
+| `HOMEPAGE_FAVICON_PROXY` | 空（直连） | 图标抓取的可选代理 URL（`http`/`https`/`socks5`/`socks5h`）；永不使用环境代理——走代理时代理自行解析目标，SSRF 防护只能校验代理自身 IP |
 | `HOMEPAGE_FAVICON_TIMEOUT` | `8s` | 图标抓取单请求超时 |
 | `HOMEPAGE_PORT` | `8080` | 仅 compose 使用：映射到宿主的端口 |
 

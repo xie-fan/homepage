@@ -48,6 +48,7 @@ Dockerfile  docker-compose.yml  .dockerignore  README.md
 | `HOMEPAGE_DATA_DIR` | `./data` | DB + icon cache dir |
 | `HOMEPAGE_FAVICON_ALLOW_PRIVATE` | `false` | allow fetching icons from private/loopback IPs |
 | `HOMEPAGE_FAVICON_FALLBACK` | `` (off) | optional third-party fallback: `google` or `duckduckgo` |
+| `HOMEPAGE_FAVICON_PROXY` | `` (direct) | optional proxy URL for icon fetches (`http`/`https`/`socks5`/`socks5h`); env proxies are never used — with a proxy the SSRF guard can only vet the proxy's IP, not the target's |
 | `HOMEPAGE_FAVICON_TIMEOUT` | `8s` | per-request timeout |
 
 ## DB schema (migration 0001)

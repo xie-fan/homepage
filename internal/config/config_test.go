@@ -11,6 +11,7 @@ var envKeys = []string{
 	"HOMEPAGE_DATA_DIR",
 	"HOMEPAGE_FAVICON_ALLOW_PRIVATE",
 	"HOMEPAGE_FAVICON_FALLBACK",
+	"HOMEPAGE_FAVICON_PROXY",
 	"HOMEPAGE_FAVICON_TIMEOUT",
 }
 
@@ -81,6 +82,52 @@ func TestLoadInvalid(t *testing.T) {
 	} {
 		if !strings.Contains(err.Error(), k) {
 			t.Errorf("error %q does not mention %s", err, k)
+		}
+	}
+}
+
+func TestLoadFaviconProxy(t *testing.T) {
+	clearEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.FaviconProxy != nil {
+		t.Fatalf("default FaviconProxy = %v, want nil (direct)", cfg.FaviconProxy)
+	}
+
+	for _, v := range []string{
+		"http://proxy.local:3128",
+		"https://user:pw@proxy.local:3128",
+		"socks5://127.0.0.1:1080",
+		"socks5h://127.0.0.1:1080",
+	} {
+		t.Setenv("HOMEPAGE_FAVICON_PROXY", v)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() with proxy %q error: %v", v, err)
+		}
+		if cfg.FaviconProxy == nil || cfg.FaviconProxy.String() != v {
+			t.Fatalf("proxy %q: FaviconProxy = %v", v, cfg.FaviconProxy)
+		}
+	}
+}
+
+func TestLoadFaviconProxyInvalid(t *testing.T) {
+	clearEnv(t)
+	for _, v := range []string{
+		"not a url",
+		"proxy.local:3128",     // missing scheme
+		"http://",              // missing host
+		"ftp://proxy.local:21", // unsupported scheme
+		"http://[::1",          // malformed
+	} {
+		t.Setenv("HOMEPAGE_FAVICON_PROXY", v)
+		_, err := Load()
+		if err == nil {
+			t.Errorf("Load() with proxy %q error = nil, want non-nil", v)
+		} else if !strings.Contains(err.Error(), "HOMEPAGE_FAVICON_PROXY") {
+			t.Errorf("error %q does not mention HOMEPAGE_FAVICON_PROXY", err)
 		}
 	}
 }

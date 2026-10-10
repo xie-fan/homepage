@@ -46,6 +46,13 @@ type Options struct {
 	// Fallback selects a third-party icon service tried last:
 	// "" (off), "google" or "duckduckgo".
 	Fallback string
+	// Proxy is an optional explicit proxy URL for icon requests; nil
+	// means connect directly. Environment proxy variables are never
+	// honored: a proxy resolves the target hostname itself, so the SSRF
+	// guard's per-dial IP check could no longer see the real
+	// destination — with Proxy set, only the proxy's own address is
+	// vetted.
+	Proxy *url.URL
 	// UserAgent overrides the default browser-like UA.
 	UserAgent string
 }
@@ -59,7 +66,8 @@ type Fetcher struct {
 
 // New builds a Fetcher. The underlying http.Client dials through the
 // SSRF guard, follows at most 5 redirects, and refuses redirect targets
-// that are not http/https.
+// that are not http/https. Requests go direct by default — never via
+// HTTP(S)_PROXY env vars — unless Options.Proxy is set.
 func New(opts Options) *Fetcher {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 8 * time.Second
@@ -68,13 +76,17 @@ func New(opts Options) *Fetcher {
 		opts.UserAgent = defaultUserAgent
 	}
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           newDialer(opts.AllowPrivate, opts.Timeout).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          32,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+	}
+	if opts.Proxy != nil {
+		// Opt-in only: the proxy does DNS + connect, so the guard then
+		// sees just the proxy's address, not the target's.
+		transport.Proxy = http.ProxyURL(opts.Proxy)
 	}
 	client := &http.Client{
 		Transport: transport,

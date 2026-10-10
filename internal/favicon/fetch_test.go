@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -186,6 +189,102 @@ func TestFetchDataURI(t *testing.T) {
 	data, ct, err := newFetcher(Options{}).Fetch(context.Background(), srv.URL)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
+	}
+	if ct != "image/png" || !bytes.Equal(data, png1x1) {
+		t.Fatalf("got ct=%q %d bytes", ct, len(data))
+	}
+}
+
+// nonLoopbackListener returns a TCP listener bound to a non-loopback
+// IPv4 interface. ProxyFromEnvironment exempts loopback targets, so a
+// test needs a LAN-ish address to observe whether *_PROXY env vars are
+// honored at all.
+func nonLoopbackListener(t *testing.T) net.Listener {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("InterfaceAddrs: %v", err)
+	}
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := ipn.IP.To4()
+		if ip4 == nil || ip4.IsLoopback() || !ip4.IsGlobalUnicast() {
+			continue
+		}
+		if ln, err := net.Listen("tcp4", net.JoinHostPort(ip4.String(), "0")); err == nil {
+			return ln
+		}
+	}
+	t.Skip("no usable non-loopback IPv4 interface")
+	return nil
+}
+
+func TestFetchIgnoresProxyEnv(t *testing.T) {
+	// A dead proxy for both schemes: if the fetcher honored *_PROXY
+	// env vars, the request below would be routed through it and fail.
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+	t.Setenv("NO_PROXY", "")
+
+	f := newFetcher(Options{})
+	defer f.Close()
+	if f.transport.Proxy != nil {
+		t.Fatal("default fetcher is not direct: transport.Proxy set")
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<link rel="icon" href="/i.png">`))
+	})
+	serveIcon(t, mux, "/i.png", "image/png", png1x1)
+	srv := httptest.NewUnstartedServer(mux)
+	_ = srv.Listener.Close()
+	srv.Listener = nonLoopbackListener(t)
+	srv.URL = "" // let Start derive it from the new listener
+	srv.Start()
+	defer srv.Close()
+
+	data, ct, err := f.Fetch(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if ct != "image/png" || !bytes.Equal(data, png1x1) {
+		t.Fatalf("got ct=%q %d bytes", ct, len(data))
+	}
+}
+
+func TestFetchViaConfiguredProxy(t *testing.T) {
+	var hits atomic.Int32
+	// A fake forward proxy: every proxied plain-http GET lands here.
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if !r.URL.IsAbs() {
+			t.Errorf("proxied request not in absolute-URI form: %q", r.URL)
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(png1x1)
+	}))
+	defer proxy.Close()
+
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	f := newFetcher(Options{Proxy: proxyURL})
+	defer f.Close()
+
+	// The page fetch returns image/png (no links), so the fetcher falls
+	// through to /favicon.ico — also via the proxy.
+	data, ct, err := f.Fetch(context.Background(), "http://icon.example/")
+	if err != nil {
+		t.Fatalf("Fetch via proxy: %v", err)
+	}
+	if hits.Load() == 0 {
+		t.Fatal("no request reached the proxy")
 	}
 	if ct != "image/png" || !bytes.Equal(data, png1x1) {
 		t.Fatalf("got ct=%q %d bytes", ct, len(data))
