@@ -36,9 +36,9 @@ const iconCacheControl = "public, max-age=86400"
 // succeeded (icon_status = ok) — or if the cached file is gone — it 404s
 // and the frontend falls back to a letter avatar.
 func (s *server) getIcon(w http.ResponseWriter, r *http.Request) {
-	id, err := pathID(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	id, aerr := pathID(r)
+	if aerr != nil {
+		writeErr(w, aerr)
 		return
 	}
 	ctx := r.Context()
@@ -48,13 +48,13 @@ func (s *server) getIcon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if b.IconStatus != store.IconOK {
-		writeError(w, http.StatusNotFound, "no icon")
+		writeErr(w, errNoIcon)
 		return
 	}
 	path, contentType, err := s.icons.IconFile(ctx, b)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "no icon")
+			writeErr(w, errNoIcon)
 			return
 		}
 		s.handleErr(w, r, err)

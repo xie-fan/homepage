@@ -19,12 +19,12 @@ func (s *server) getSettings(w http.ResponseWriter, r *http.Request) {
 // answers with it as persisted.
 func (s *server) putSettings(w http.ResponseWriter, r *http.Request) {
 	var in store.Settings
-	if err := decodeJSON(w, r, &in, maxBody); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if aerr := decodeJSON(w, r, &in, maxBody); aerr != nil {
+		writeErr(w, aerr)
 		return
 	}
 	if err := in.Grid.Validate(); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeErr(w, badInput(codeInvalidGrid, "grid", err.Error()))
 		return
 	}
 	if err := s.store.SettingsStore.Put(r.Context(), in); err != nil {

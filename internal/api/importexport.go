@@ -72,26 +72,26 @@ func (s *server) importBookmarks(w http.ResponseWriter, r *http.Request) {
 		mode = "append"
 	}
 	if mode != "append" && mode != "replace" {
-		writeError(w, http.StatusBadRequest,
-			fmt.Sprintf("invalid mode %q: want append or replace", mode))
+		writeErr(w, badInput(codeInvalidMode, "mode",
+			fmt.Sprintf("invalid mode %q: want append or replace", mode)))
 		return
 	}
-	items, settings, err := decodeImportBody(w, r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	items, settings, aerr := decodeImportBody(w, r)
+	if aerr != nil {
+		writeErr(w, aerr)
 		return
 	}
 	if len(items) > maxImportItems {
-		writeError(w, http.StatusBadRequest,
-			fmt.Sprintf("too many bookmarks: %d (max %d)", len(items), maxImportItems))
+		writeErr(w, badInput(codeImportTooLarge, "",
+			fmt.Sprintf("too many bookmarks: %d (max %d)", len(items), maxImportItems)))
 		return
 	}
 	// Validate everything up front so a bad item rejects the whole import.
 	for i, nb := range items {
-		title, rawURL, err := validateBookmarkInput(nb.Title, nb.URL)
-		if err != nil {
-			writeError(w, http.StatusBadRequest,
-				fmt.Sprintf("bookmarks[%d]: %s", i, err))
+		title, rawURL, verr := validateBookmarkInput(nb.Title, nb.URL)
+		if verr != nil {
+			writeErr(w, badInput(codeImportInvalid, verr.Field,
+				fmt.Sprintf("bookmarks[%d]: %s", i, verr.Msg)))
 			return
 		}
 		items[i] = store.NewBookmark{Title: title, URL: rawURL}
@@ -100,7 +100,7 @@ func (s *server) importBookmarks(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if mode == "replace" && settings != nil {
 		if err := settings.Grid.Validate(); err != nil {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("settings: %s", err))
+			writeErr(w, badInput(codeInvalidGrid, "grid", fmt.Sprintf("settings: %s", err)))
 			return
 		}
 		if err := s.store.SettingsStore.Put(ctx, *settings); err != nil {
@@ -110,6 +110,7 @@ func (s *server) importBookmarks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var created []store.Bookmark
+	var err error
 	if mode == "replace" {
 		created, err = s.store.ReplaceAll(ctx, items)
 	} else {
@@ -127,26 +128,32 @@ func (s *server) importBookmarks(w http.ResponseWriter, r *http.Request) {
 
 // decodeImportBody reads the import payload: either the export object or
 // a bare [ {title,url}, ... ] array. Returns the bookmark items and the
-// optional embedded settings (nil when absent or when importing an array).
-func decodeImportBody(w http.ResponseWriter, r *http.Request) ([]store.NewBookmark, *store.Settings, error) {
+// optional embedded settings (nil when absent or when importing an
+// array), or an *apiError describing the bad payload.
+func decodeImportBody(w http.ResponseWriter, r *http.Request) ([]store.NewBookmark, *store.Settings, *apiError) {
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxImportBody))
 	if err != nil {
-		return nil, nil, fmt.Errorf("import body unreadable or over %d bytes", maxImportBody)
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			return nil, nil, badInput(codeImportTooLarge, "",
+				fmt.Sprintf("import body too large: max %d bytes", maxImportBody))
+		}
+		return nil, nil, badInput(codeImportInvalid, "", "import body unreadable")
 	}
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 {
-		return nil, nil, errors.New("empty import body")
+		return nil, nil, badInput(codeImportInvalid, "", "empty import body")
 	}
 	if raw[0] == '[' {
 		var items []store.NewBookmark
 		if err := json.Unmarshal(raw, &items); err != nil {
-			return nil, nil, fmt.Errorf("invalid JSON array: %w", err)
+			return nil, nil, badInput(codeImportInvalid, "", "invalid JSON array")
 		}
 		return items, nil, nil
 	}
 	var doc importDoc
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		return nil, nil, fmt.Errorf("invalid JSON object: %w", err)
+		return nil, nil, badInput(codeImportInvalid, "", "invalid JSON object")
 	}
 	return doc.Bookmarks, doc.Settings, nil
 }

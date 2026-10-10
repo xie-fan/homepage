@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"homepage/internal/store"
@@ -38,6 +39,11 @@ type server struct {
 	icons  IconService
 	logger *slog.Logger
 	static http.Handler // file server for the embedded UI
+	// apiPaths mirrors the API routes without methods so unknownAPI can
+	// tell a wrong-method call (405) from an unknown path (404);
+	// apiMethods lists the registered methods per path pattern.
+	apiPaths   *http.ServeMux
+	apiMethods map[string][]string
 }
 
 // NewServer builds the API handler: all routes plus logging and recover
@@ -52,20 +58,31 @@ func NewServer(deps Deps) http.Handler {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/health", s.health)
-	mux.HandleFunc("GET /api/bookmarks", s.listBookmarks)
-	mux.HandleFunc("POST /api/bookmarks", s.createBookmark)
-	mux.HandleFunc("PUT /api/bookmarks/{id}", s.updateBookmark)
-	mux.HandleFunc("DELETE /api/bookmarks/{id}", s.deleteBookmark)
+	s.apiPaths = http.NewServeMux()
+	s.apiMethods = map[string][]string{}
+	nop := func(http.ResponseWriter, *http.Request) {}
+	route := func(pattern string, h http.HandlerFunc) {
+		mux.HandleFunc(pattern, h)
+		method, path, _ := strings.Cut(pattern, " ")
+		if _, ok := s.apiMethods[path]; !ok {
+			s.apiPaths.HandleFunc(path, nop)
+		}
+		s.apiMethods[path] = append(s.apiMethods[path], method)
+	}
+	route("GET /api/health", s.health)
+	route("GET /api/bookmarks", s.listBookmarks)
+	route("POST /api/bookmarks", s.createBookmark)
+	route("PUT /api/bookmarks/{id}", s.updateBookmark)
+	route("DELETE /api/bookmarks/{id}", s.deleteBookmark)
 	// For PUT /api/bookmarks/order the mux prefers this literal pattern
 	// over PUT /api/bookmarks/{id} (verified by TestReorder).
-	mux.HandleFunc("PUT /api/bookmarks/order", s.reorderBookmarks)
-	mux.HandleFunc("POST /api/bookmarks/{id}/icon/refresh", s.refreshIcon)
-	mux.HandleFunc("GET /api/icons/{id}", s.getIcon)
-	mux.HandleFunc("GET /api/settings", s.getSettings)
-	mux.HandleFunc("PUT /api/settings", s.putSettings)
-	mux.HandleFunc("GET /api/export", s.exportBookmarks)
-	mux.HandleFunc("POST /api/import", s.importBookmarks)
+	route("PUT /api/bookmarks/order", s.reorderBookmarks)
+	route("POST /api/bookmarks/{id}/icon/refresh", s.refreshIcon)
+	route("GET /api/icons/{id}", s.getIcon)
+	route("GET /api/settings", s.getSettings)
+	route("PUT /api/settings", s.putSettings)
+	route("GET /api/export", s.exportBookmarks)
+	route("POST /api/import", s.importBookmarks)
 
 	// Unmatched /api paths (any method) get a JSON 404 instead of the file
 	// server's plain-text one. More specific API patterns win over these.
@@ -86,9 +103,16 @@ func NewServer(deps Deps) http.Handler {
 	return s.logRequests(s.recover(mux))
 }
 
-// unknownAPI is the catch-all for /api paths without a route.
-func (s *server) unknownAPI(w http.ResponseWriter, _ *http.Request) {
-	writeError(w, http.StatusNotFound, "not found")
+// unknownAPI is the catch-all for /api requests no route claimed: a
+// known path with the wrong method is a 405 (with Allow), anything else
+// a 404.
+func (s *server) unknownAPI(w http.ResponseWriter, r *http.Request) {
+	if _, pattern := s.apiPaths.Handler(r); pattern != "" {
+		w.Header().Set("Allow", strings.Join(s.apiMethods[pattern], ", "))
+		writeErr(w, errBadMethod)
+		return
+	}
+	writeErr(w, errNotFound)
 }
 
 // serveStatic serves the embedded UI for every non-/api GET path — the
@@ -97,7 +121,7 @@ func (s *server) unknownAPI(w http.ResponseWriter, _ *http.Request) {
 func (s *server) serveStatic(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErr(w, errBadMethod)
 		return
 	}
 	s.static.ServeHTTP(w, r)
@@ -150,7 +174,7 @@ func (s *server) recover(next http.Handler) http.Handler {
 			if p := recover(); p != nil {
 				s.logger.Error("handler panic",
 					"method", r.Method, "path", r.URL.Path, "err", p)
-				writeError(w, http.StatusInternalServerError, "internal error")
+				writeErr(w, errInternal)
 			}
 		}()
 		next.ServeHTTP(w, r)
@@ -158,20 +182,26 @@ func (s *server) recover(next http.Handler) http.Handler {
 }
 
 // decodeJSON decodes a JSON request body of at most limit bytes into v.
-// Unknown fields are ignored — decoding is deliberately lenient.
-func decodeJSON(w http.ResponseWriter, r *http.Request, v any, limit int64) error {
+// Unknown fields are ignored — decoding is deliberately lenient. The
+// decoder's detail is dropped: callers get a fixed "invalid JSON".
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any, limit int64) *apiError {
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
-		return fmt.Errorf("invalid JSON: %w", err)
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			return badInput(codeInvalidJSON, "", "request body too large")
+		}
+		return errBadJSON
 	}
 	return nil
 }
 
 // pathID parses the {id} path value as a positive int64.
-func pathID(r *http.Request) (int64, error) {
+func pathID(r *http.Request) (int64, *apiError) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id < 1 {
-		return 0, fmt.Errorf("invalid bookmark id %q", r.PathValue("id"))
+		return 0, badInput(codeInvalidID, "id",
+			fmt.Sprintf("invalid bookmark id %q", r.PathValue("id")))
 	}
 	return id, nil
 }
@@ -184,22 +214,18 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
-}
-
 // handleErr maps domain errors to responses: ErrNotFound → 404,
 // ErrInvalidOrder → 400 (the wrapped detail is safe to show), anything
 // else → 500 with details logged server-side only.
 func (s *server) handleErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		writeError(w, http.StatusNotFound, "not found")
+		writeErr(w, errNotFound)
 	case errors.Is(err, store.ErrInvalidOrder):
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeErr(w, badInput(codeInvalidOrder, "ids", err.Error()))
 	default:
 		s.logger.Error("request failed",
 			"method", r.Method, "path", r.URL.Path, "err", err)
-		writeError(w, http.StatusInternalServerError, "internal error")
+		writeErr(w, errInternal)
 	}
 }

@@ -145,6 +145,13 @@ func decodeResp(t *testing.T, resp *http.Response, out any) int {
 	return resp.StatusCode
 }
 
+// errBody decodes the API error envelope {"error","code","field"?}.
+type errBody struct {
+	Error string `json:"error"`
+	Code  string `json:"code"`
+	Field string `json:"field"`
+}
+
 func readAll(t *testing.T, resp *http.Response) []byte {
 	t.Helper()
 	defer resp.Body.Close()
@@ -236,34 +243,53 @@ func TestBookmarkCRUD(t *testing.T) {
 	if raw := readAll(t, resp); strings.TrimSpace(string(raw)) != "[]" {
 		t.Fatalf("list after delete = %s, want []", raw)
 	}
+	var e errBody
 	if code := reqJSON(t, srv, http.MethodDelete,
-		fmt.Sprintf("/api/bookmarks/%d", b.ID), nil, nil); code != http.StatusNotFound {
+		fmt.Sprintf("/api/bookmarks/%d", b.ID), nil, &e); code != http.StatusNotFound {
 		t.Fatalf("re-delete = %d, want 404", code)
+	}
+	if e.Code != codeNotFound {
+		t.Fatalf("re-delete code = %q, want %q", e.Code, codeNotFound)
 	}
 }
 
 func TestCreateValidation(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	longURL := "https://example.com/" + strings.Repeat("x", maxURLLen)
-	cases := map[string]map[string]string{
-		"ftp scheme":        {"url": "ftp://example.com"},
-		"javascript scheme": {"url": "javascript:alert(1)"},
-		"no scheme":         {"url": "example.com"},
-		"missing host":      {"url": "https:///path"},
-		"empty host":        {"url": "https://"},
-		"userinfo":          {"url": "https://user:pw@example.com"},
-		"url too long":      {"url": longURL},
-		"missing url":       {"title": "x"},
-		"title too long":    {"title": strings.Repeat("t", maxTitleRunes+1), "url": "https://example.com"},
+	cases := []struct {
+		name             string
+		body             map[string]string
+		wantCode, wantIn string // wantIn is the expected "field" value
+	}{
+		{"ftp scheme", map[string]string{"url": "ftp://example.com"}, codeURLScheme, "url"},
+		{"javascript scheme", map[string]string{"url": "javascript:alert(1)"}, codeURLScheme, "url"},
+		{"no scheme", map[string]string{"url": "example.com"}, codeURLScheme, "url"},
+		{"unparsable url", map[string]string{"url": "https://exa mple.com"}, codeURLInvalid, "url"},
+		{"missing host", map[string]string{"url": "https:///path"}, codeURLInvalid, "url"},
+		{"empty host", map[string]string{"url": "https://"}, codeURLInvalid, "url"},
+		{"userinfo", map[string]string{"url": "https://user:pw@example.com"}, codeURLUserinfo, "url"},
+		{"url too long", map[string]string{"url": longURL}, codeURLTooLong, "url"},
+		{"missing url", map[string]string{"title": "x"}, codeURLRequired, "url"},
+		{"title too long", map[string]string{"title": strings.Repeat("t", maxTitleRunes+1), "url": "https://example.com"}, codeTitleTooLong, "title"},
 	}
-	for name, body := range cases {
-		var out map[string]string
-		code := reqJSON(t, srv, http.MethodPost, "/api/bookmarks", body, &out)
+	for _, tc := range cases {
+		var out errBody
+		code := reqJSON(t, srv, http.MethodPost, "/api/bookmarks", tc.body, &out)
 		if code != http.StatusBadRequest {
-			t.Errorf("%s: status %d, want 400", name, code)
+			t.Errorf("%s: status %d, want 400", tc.name, code)
 		}
-		if out["error"] == "" {
-			t.Errorf("%s: response has no error message: %v", name, out)
+		if out.Error == "" {
+			t.Errorf("%s: response has no error message: %+v", tc.name, out)
+		}
+		if out.Code != tc.wantCode {
+			t.Errorf("%s: code %q, want %q", tc.name, out.Code, tc.wantCode)
+		}
+		if out.Field != tc.wantIn {
+			t.Errorf("%s: field %q, want %q", tc.name, out.Field, tc.wantIn)
+		}
+		// Raw url.Parse errors must not leak into the message.
+		if tc.name == "unparsable url" && out.Error != "invalid URL" {
+			t.Errorf("%s: error %q, want %q", tc.name, out.Error, "invalid URL")
 		}
 	}
 	// Rejected creates persisted nothing.
@@ -301,13 +327,21 @@ func TestNotFound(t *testing.T) {
 		{http.MethodPost, "/api/bookmarks/999/icon/refresh", nil},
 		{http.MethodGet, "/api/icons/999", nil},
 	} {
-		if code := reqJSON(t, srv, tc.method, tc.path, tc.body, nil); code != http.StatusNotFound {
+		var out errBody
+		if code := reqJSON(t, srv, tc.method, tc.path, tc.body, &out); code != http.StatusNotFound {
 			t.Errorf("%s %s: %d, want 404", tc.method, tc.path, code)
+		}
+		if out.Code != codeNotFound {
+			t.Errorf("%s %s: code %q, want %q", tc.method, tc.path, out.Code, codeNotFound)
 		}
 	}
 	// A non-numeric {id} is a 400, not a 404.
-	if code := reqJSON(t, srv, http.MethodDelete, "/api/bookmarks/abc", nil, nil); code != http.StatusBadRequest {
+	var out errBody
+	if code := reqJSON(t, srv, http.MethodDelete, "/api/bookmarks/abc", nil, &out); code != http.StatusBadRequest {
 		t.Errorf("bad id: %d, want 400", code)
+	}
+	if out.Code != codeInvalidID || out.Field != "id" {
+		t.Errorf("bad id: body = %+v, want code %q field \"id\"", out, codeInvalidID)
 	}
 }
 
@@ -342,14 +376,17 @@ func TestReorder(t *testing.T) {
 		"unknown id": {a.ID, b.ID, c.ID, 9999},
 		"duplicate":  {a.ID, a.ID, b.ID},
 	} {
-		var out map[string]string
+		var out errBody
 		code := reqJSON(t, srv, http.MethodPut, "/api/bookmarks/order",
 			map[string][]int64{"ids": ids}, &out)
 		if code != http.StatusBadRequest {
 			t.Errorf("%s: %d, want 400", name, code)
 		}
-		if out["error"] == "" {
+		if out.Error == "" {
 			t.Errorf("%s: no error message", name)
+		}
+		if out.Code != codeInvalidOrder {
+			t.Errorf("%s: code %q, want %q", name, out.Code, codeInvalidOrder)
 		}
 	}
 	// Rejected reorders leave the stored order untouched.
@@ -382,13 +419,21 @@ func TestSettings(t *testing.T) {
 		"cols too big":   store.Settings{Grid: store.Grid{Rows: 4, Cols: 7}},
 		"zero grid":      store.Settings{},
 	} {
-		if code := reqJSON(t, srv, http.MethodPut, "/api/settings", body, nil); code != http.StatusBadRequest {
+		var out errBody
+		if code := reqJSON(t, srv, http.MethodPut, "/api/settings", body, &out); code != http.StatusBadRequest {
 			t.Errorf("%s: %d, want 400", name, code)
+		}
+		if out.Code != codeInvalidGrid || out.Field != "grid" {
+			t.Errorf("%s: body = %+v, want code %q field \"grid\"", name, out, codeInvalidGrid)
 		}
 	}
 	// Malformed JSON is also a 400; stored settings survive all of it.
-	if code := reqRaw(t, srv, http.MethodPut, "/api/settings", "{not json", nil); code != http.StatusBadRequest {
+	var out errBody
+	if code := reqRaw(t, srv, http.MethodPut, "/api/settings", "{not json", &out); code != http.StatusBadRequest {
 		t.Errorf("bad json: %d, want 400", code)
+	}
+	if out.Code != codeInvalidJSON {
+		t.Errorf("bad json: code %q, want %q", out.Code, codeInvalidJSON)
 	}
 	reqJSON(t, srv, http.MethodGet, "/api/settings", nil, &st)
 	if st != want {
@@ -493,28 +538,50 @@ func TestImportValidation(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
-	if raw := readAll(t, resp); !strings.Contains(string(raw), "bookmarks[1]") {
-		t.Fatalf("error does not name the bad index: %s", raw)
+	var out errBody
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	resp.Body.Close()
+	if out.Code != codeImportInvalid {
+		t.Fatalf("code = %q, want %q", out.Code, codeImportInvalid)
+	}
+	if !strings.Contains(out.Error, "bookmarks[1]") {
+		t.Fatalf("error does not name the bad index: %q", out.Error)
 	}
 	if got := listTitles(t, srv); len(got) != 0 {
 		t.Fatalf("partial import went through: %v", got)
 	}
 
-	// Over the item cap → 400.
+	// Over the item cap → 400 import_too_large.
 	big := make([]store.NewBookmark, maxImportItems+1)
 	for i := range big {
 		big[i] = store.NewBookmark{Title: "x", URL: "https://x.example.com"}
 	}
-	if code := reqJSON(t, srv, http.MethodPost, "/api/import", big, nil); code != http.StatusBadRequest {
+	out = errBody{}
+	if code := reqJSON(t, srv, http.MethodPost, "/api/import", big, &out); code != http.StatusBadRequest {
 		t.Fatalf("oversize import = %d, want 400", code)
 	}
-
-	// Unknown mode and empty body are 400s too.
-	if code := reqRaw(t, srv, http.MethodPost, "/api/import?mode=sideways", `[]`, nil); code != http.StatusBadRequest {
-		t.Errorf("bad mode = %d, want 400", code)
+	if out.Code != codeImportTooLarge {
+		t.Fatalf("oversize code = %q, want %q", out.Code, codeImportTooLarge)
 	}
-	if code := reqRaw(t, srv, http.MethodPost, "/api/import", ``, nil); code != http.StatusBadRequest {
-		t.Errorf("empty body = %d, want 400", code)
+
+	// Unknown mode and empty/invalid bodies are 400s too.
+	for _, tc := range []struct {
+		name, path, body, wantCode string
+	}{
+		{"bad mode", "/api/import?mode=sideways", `[]`, codeInvalidMode},
+		{"empty body", "/api/import", ``, codeImportInvalid},
+		{"bad json object", "/api/import", `{`, codeImportInvalid},
+		{"bad json array", "/api/import", `[{"url":`, codeImportInvalid},
+	} {
+		out = errBody{}
+		if code := reqRaw(t, srv, http.MethodPost, tc.path, tc.body, &out); code != http.StatusBadRequest {
+			t.Errorf("%s = %d, want 400", tc.name, code)
+		}
+		if out.Code != tc.wantCode {
+			t.Errorf("%s: code %q, want %q", tc.name, out.Code, tc.wantCode)
+		}
 	}
 }
 
@@ -524,8 +591,12 @@ func TestImportReplaceInvalidSettings(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	postBookmark(t, srv, "keep", "https://keep.example.com")
 	body := `{"settings":{"grid":{"rows":99,"cols":5}},"bookmarks":[{"url":"https://x.example.com"}]}`
-	if code := reqRaw(t, srv, http.MethodPost, "/api/import?mode=replace", body, nil); code != http.StatusBadRequest {
+	var out errBody
+	if code := reqRaw(t, srv, http.MethodPost, "/api/import?mode=replace", body, &out); code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", code)
+	}
+	if out.Code != codeInvalidGrid {
+		t.Fatalf("code = %q, want %q", out.Code, codeInvalidGrid)
 	}
 	// Nothing was replaced.
 	if got := listTitles(t, srv); !slices.Equal(got, []string{"keep"}) {
@@ -543,8 +614,12 @@ func TestGetIcon(t *testing.T) {
 	iconURL := fmt.Sprintf("/api/icons/%d", b.ID)
 
 	// Icon not fetched yet (status pending) → 404.
-	if code := reqJSON(t, srv, http.MethodGet, iconURL, nil, nil); code != http.StatusNotFound {
+	var e errBody
+	if code := reqJSON(t, srv, http.MethodGet, iconURL, nil, &e); code != http.StatusNotFound {
 		t.Fatalf("pending icon = %d, want 404", code)
+	}
+	if e.Code != codeNotFound {
+		t.Fatalf("pending icon code = %q, want %q", e.Code, codeNotFound)
 	}
 
 	// Status ok → serve the file the IconService reports, with headers.
@@ -639,25 +714,51 @@ func TestUnknownAPIPath(t *testing.T) {
 	// Unknown /api paths get a JSON 404 for every method, never the file
 	// server's plain-text response.
 	for _, method := range []string{http.MethodGet, http.MethodPost} {
-		var out map[string]string
+		var out errBody
 		code := reqJSON(t, srv, method, "/api/no-such-route", nil, &out)
 		if code != http.StatusNotFound {
 			t.Errorf("%s /api/no-such-route: status %d, want 404", method, code)
 		}
-		if out["error"] == "" {
-			t.Errorf("%s /api/no-such-route: body %v has no error", method, out)
+		if out.Code != codeNotFound {
+			t.Errorf("%s /api/no-such-route: code %q, want %q", method, out.Code, codeNotFound)
 		}
 	}
 
-	var out map[string]string
+	var out errBody
 	if code := reqJSON(t, srv, http.MethodGet, "/api", nil, &out); code != http.StatusNotFound {
 		t.Errorf("GET /api: status %d, want 404", code)
 	}
 
+	// A known API path with the wrong method is a 405 listing Allow.
+	for _, tc := range []struct {
+		method, path, allow string
+	}{
+		{http.MethodDelete, "/api/settings", "GET, PUT"},
+		{http.MethodGet, "/api/bookmarks/order", "PUT"},
+		{http.MethodDelete, "/api/bookmarks", "GET, POST"},
+		{http.MethodGet, "/api/bookmarks/1", "PUT, DELETE"},
+	} {
+		resp := do(t, srv, tc.method, tc.path, nil)
+		var e errBody
+		code := decodeResp(t, resp, &e)
+		if code != http.StatusMethodNotAllowed {
+			t.Errorf("%s %s: status %d, want 405", tc.method, tc.path, code)
+		}
+		if e.Code != codeMethodNotAllowed {
+			t.Errorf("%s %s: code %q, want %q", tc.method, tc.path, e.Code, codeMethodNotAllowed)
+		}
+		if allow := resp.Header.Get("Allow"); allow != tc.allow {
+			t.Errorf("%s %s: Allow %q, want %q", tc.method, tc.path, allow, tc.allow)
+		}
+	}
+
 	// A non-GET method on a static path is a 405, not a file response.
 	resp := do(t, srv, http.MethodPost, "/", nil)
-	_ = readAll(t, resp)
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("POST /: status %d, want 405", resp.StatusCode)
+	var e errBody
+	if code := decodeResp(t, resp, &e); code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /: status %d, want 405", code)
+	}
+	if e.Code != codeMethodNotAllowed {
+		t.Errorf("POST /: code %q, want %q", e.Code, codeMethodNotAllowed)
 	}
 }

@@ -23,13 +23,13 @@ func (s *server) listBookmarks(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) createBookmark(w http.ResponseWriter, r *http.Request) {
 	var in bookmarkIn
-	if err := decodeJSON(w, r, &in, maxBody); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if aerr := decodeJSON(w, r, &in, maxBody); aerr != nil {
+		writeErr(w, aerr)
 		return
 	}
-	title, rawURL, err := validateBookmarkInput(in.Title, in.URL)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	title, rawURL, aerr := validateBookmarkInput(in.Title, in.URL)
+	if aerr != nil {
+		writeErr(w, aerr)
 		return
 	}
 	b, err := s.store.Create(r.Context(), title, rawURL)
@@ -42,19 +42,19 @@ func (s *server) createBookmark(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) updateBookmark(w http.ResponseWriter, r *http.Request) {
-	id, err := pathID(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	id, aerr := pathID(r)
+	if aerr != nil {
+		writeErr(w, aerr)
 		return
 	}
 	var in bookmarkIn
-	if err := decodeJSON(w, r, &in, maxBody); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if aerr := decodeJSON(w, r, &in, maxBody); aerr != nil {
+		writeErr(w, aerr)
 		return
 	}
-	title, rawURL, err := validateBookmarkInput(in.Title, in.URL)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	title, rawURL, aerr := validateBookmarkInput(in.Title, in.URL)
+	if aerr != nil {
+		writeErr(w, aerr)
 		return
 	}
 	// Fetched up front for the 404 and to detect a URL change.
@@ -77,9 +77,9 @@ func (s *server) updateBookmark(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) deleteBookmark(w http.ResponseWriter, r *http.Request) {
-	id, err := pathID(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	id, aerr := pathID(r)
+	if aerr != nil {
+		writeErr(w, aerr)
 		return
 	}
 	if err := s.store.Delete(r.Context(), id); err != nil {
@@ -96,8 +96,8 @@ func (s *server) reorderBookmarks(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		IDs []int64 `json:"ids"`
 	}
-	if err := decodeJSON(w, r, &in, maxBody); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if aerr := decodeJSON(w, r, &in, maxBody); aerr != nil {
+		writeErr(w, aerr)
 		return
 	}
 	if err := s.store.Reorder(r.Context(), in.IDs); err != nil {
@@ -115,9 +115,9 @@ func (s *server) reorderBookmarks(w http.ResponseWriter, r *http.Request) {
 // refreshIcon marks the bookmark's icon pending, queues a refetch, and
 // answers 202 with the updated bookmark.
 func (s *server) refreshIcon(w http.ResponseWriter, r *http.Request) {
-	id, err := pathID(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	id, aerr := pathID(r)
+	if aerr != nil {
+		writeErr(w, aerr)
 		return
 	}
 	ctx := r.Context()
