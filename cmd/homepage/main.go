@@ -16,6 +16,7 @@ import (
 	"homepage/internal/api"
 	"homepage/internal/config"
 	"homepage/internal/db"
+	"homepage/internal/favicon"
 	"homepage/internal/store"
 )
 
@@ -55,12 +56,31 @@ func run() error {
 		return fmt.Errorf("migrate database: %w", err)
 	}
 
+	st := store.NewSQLite(sqlDB)
+	fetcher := favicon.New(favicon.Options{
+		Timeout:      cfg.FaviconTimeout,
+		AllowPrivate: cfg.FaviconAllowPrivate,
+		Fallback:     cfg.FaviconFallback,
+	})
+	icons, err := favicon.NewService(st.BookmarkStore, fetcher, cfg.DataDir, slog.Default())
+	if err != nil {
+		return fmt.Errorf("init icon service: %w", err)
+	}
+	if err := icons.Start(ctx); err != nil {
+		return fmt.Errorf("start icon service: %w", err)
+	}
+	// Closed before the DB (defer LIFO) so workers can save results.
+	defer func() {
+		if err := icons.Close(); err != nil {
+			slog.Warn("close icon service", "err", err)
+		}
+	}()
+
 	srv := &http.Server{
 		Addr: cfg.Addr,
-		// NopIcons stands in until the favicon worker lands (Task 5).
 		Handler: api.NewServer(api.Deps{
-			Store:  store.NewSQLite(sqlDB),
-			Icons:  api.NopIcons{},
+			Store:  st,
+			Icons:  icons,
 			Logger: slog.Default(),
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
