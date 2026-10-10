@@ -66,11 +66,61 @@ const clampPage = () => {
   state.page = Math.min(Math.max(state.page, 0), displayPageCount() - 1);
 };
 
+// ---------- layout ----------
+//
+// The grid keeps the configured rows/cols on every viewport: the tile is
+// shrunk until the whole grid fits, never grown past the 96×106 desktop
+// tile. layout() measures the real .viewport box and writes the resolved
+// metrics (--tile-w/--tile-h/--grid-gap/--page-pad-*) as px on :root —
+// style.css derives icon/label/edit sizes from --tile-w via clamp(), and
+// dnd.js parses --tile-* back into numbers. The formula is documented
+// next to the fallbacks in style.css (:root).
+const TILE_DESKTOP_W = 96;
+const TILE_DESKTOP_H = 106;
+function layout() {
+  const { rows, cols } = state.grid;
+  const vw = els.viewport.clientWidth;
+  const vh = els.viewport.clientHeight;
+  // Side arrows overlay the page gutters at ≥768px (the .nav-arrow media
+  // query); below that — or on a single page where they are disabled —
+  // they sit in the pager row and a slim edge inset is enough.
+  const overlay =
+    getComputedStyle(els.navPrev).position === 'absolute' &&
+    displayPageCount() > 1;
+  const padX = overlay ? 64 : 12;
+  const padY = 12;
+  // Gap scales with the tile (8–14px). Bound the tile with the max gap
+  // first, pick the gap, then re-fit — one pass converges.
+  const fit = (gap) => Math.min(
+    TILE_DESKTOP_W,
+    (vw - 2 * padX - (cols - 1) * gap) / cols,
+    ((vh - 2 * padY - (rows - 1) * gap) / rows) * (TILE_DESKTOP_W / TILE_DESKTOP_H),
+  );
+  const gap = Math.round(Math.min(14, Math.max(8, fit(14) * 0.15)));
+  const tile = Math.max(1, Math.floor(fit(gap)));
+  // Tile height follows the desktop 96:106 aspect, grown a little when
+  // the floor-clamped icon (36px) plus label would not fit the aspect,
+  // and always capped at the per-row allotment so the grid can never
+  // overflow vertically. The +22 approximates padding + link gap + the
+  // 11px label line (mirrors --icon: clamp(36, .7·w, 64) in style.css).
+  const rowFit = Math.floor((vh - 2 * padY - (rows - 1) * gap) / rows);
+  const icon = Math.min(64, Math.max(36, tile * 0.7));
+  const tileH = Math.max(1, Math.min(rowFit,
+    Math.max(Math.floor(tile * (TILE_DESKTOP_H / TILE_DESKTOP_W)), Math.ceil(icon) + 22)));
+  const root = document.documentElement.style;
+  root.setProperty('--tile-w', `${tile}px`);
+  root.setProperty('--tile-h', `${tileH}px`);
+  root.setProperty('--grid-gap', `${gap}px`);
+  root.setProperty('--page-pad-x', `${padX}px`);
+  root.setProperty('--page-pad-y', `${padY}px`);
+}
+
 // ---------- rendering ----------
 
 function render() {
   clampPage();
   sessionStorage.setItem(PAGE_KEY, String(state.page));
+  layout();
   renderTrack();
   renderDots();
   updateArrows();
@@ -86,9 +136,10 @@ function renderTrack() {
   const size = pageSize();
   for (let p = 0; p < displayPageCount(); p++) {
     const page = el('div', 'page');
-    // Fixed-px tracks keep tiles a constant size whatever the grid is.
-    page.style.gridTemplateColumns = `repeat(${state.grid.cols}, var(--tile-w))`;
-    page.style.gridTemplateRows = `repeat(${state.grid.rows}, var(--tile-h))`;
+    // --cols/--rows feed the repeat()s in style.css; the track sizes
+    // (--tile-w/--tile-h) come from layout() so the grid always fits.
+    page.style.setProperty('--cols', state.grid.cols);
+    page.style.setProperty('--rows', state.grid.rows);
     const items = state.bookmarks.slice(p * size, (p + 1) * size);
     if (items.length === 0) {
       if (p === 0) {
@@ -615,7 +666,10 @@ function bindEvents() {
   els.btnSettings.addEventListener('click', openSettingsModal);
 
   document.addEventListener('keydown', onKeyDown);
-  window.addEventListener('resize', () => offsetTrack(0, false));
+  window.addEventListener('resize', () => {
+    layout();          // tiles/gutters track the new viewport box
+    offsetTrack(0, false); // re-snap: page width = viewport width changed
+  });
   els.viewport.addEventListener('wheel', onWheel, { passive: false });
   els.viewport.addEventListener('pointerdown', onPointerDown);
   els.viewport.addEventListener('pointermove', onPointerMove);
