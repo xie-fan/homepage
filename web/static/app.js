@@ -26,7 +26,12 @@ const WHEEL_RESET_MS = 200; // idle gap that ends a gesture
 const SWIPE_SLOP = 8; // px before a press becomes a drag
 const SWIPE_FLIP = 0.15; // fraction of viewport width that flips a page
 const FLICK_VELOCITY = 0.4; // px/ms that counts as a fast flick
-const LONG_PRESS_MS = 550; // touch hold that opens the edit modal
+
+// Tile drag thresholds (the drag itself lives in dnd.js; onPointerDown
+// arbitrates between tile drag and page swipe).
+const TILE_DRAG_SLOP = 6; // px of movement (mouse on tile) that starts a drag
+const TILE_HOLD_MS = 350; // touch/pen hold on a tile that starts a drag
+const HOLD_SLOP = 10; // px of wandering that forfeits a pending touch hold
 
 const POLL_INTERVAL = 1500; // ms between bookmark re-fetches
 const POLL_TRIES = 8; // give up after ~12s of pending icons
@@ -52,8 +57,13 @@ function el(tag, className, text) {
 
 const pageSize = () => state.grid.rows * state.grid.cols;
 const pageCount = () => Math.max(1, Math.ceil(state.bookmarks.length / pageSize()));
+// While a tile drag runs on a full last page, dnd.js asks for one extra
+// empty page so an item can be carried "past the end" — a drop there lands
+// at the tail of the flat position list.
+const displayPageCount = () =>
+  pageCount() + (tileDnd && tileDnd.wantsExtraPage() ? 1 : 0);
 const clampPage = () => {
-  state.page = Math.min(Math.max(state.page, 0), pageCount() - 1);
+  state.page = Math.min(Math.max(state.page, 0), displayPageCount() - 1);
 };
 
 // ---------- rendering ----------
@@ -64,22 +74,31 @@ function render() {
   renderTrack();
   renderDots();
   updateArrows();
-  // Do not yank the track mid-swipe; the drag handler owns it then.
-  if (!drag || !drag.active) offsetTrack(0, false);
+  // Do not yank the track mid-gesture: during a swipe the finger owns it,
+  // during a tile drag goToPage (edge flips) owns it.
+  if ((!drag || !drag.active) && !(tileDnd && tileDnd.active())) {
+    offsetTrack(0, false);
+  }
 }
 
 function renderTrack() {
   els.track.replaceChildren();
   const size = pageSize();
-  for (let p = 0; p < pageCount(); p++) {
+  for (let p = 0; p < displayPageCount(); p++) {
     const page = el('div', 'page');
     // Fixed-px tracks keep tiles a constant size whatever the grid is.
     page.style.gridTemplateColumns = `repeat(${state.grid.cols}, var(--tile-w))`;
     page.style.gridTemplateRows = `repeat(${state.grid.rows}, var(--tile-h))`;
     const items = state.bookmarks.slice(p * size, (p + 1) * size);
     if (items.length === 0) {
-      page.append(el('p', 'empty',
-        state.loadError ? `加载失败：${state.loadError}` : '还没有书签，点击 + 添加'));
+      if (p === 0) {
+        page.append(el('p', 'empty',
+          state.loadError ? `加载失败：${state.loadError}` : '还没有书签，点击 + 添加'));
+      } else {
+        // The extra last page shown during a drag on a full grid: a dashed
+        // slot marks it as a valid "new page" drop target.
+        page.append(el('div', 'tile drop-slot'));
+      }
     } else {
       for (const b of items) page.append(makeTile(b));
     }
@@ -90,6 +109,8 @@ function renderTrack() {
 function makeTile(b) {
   const tile = el('div', 'tile');
   tile.dataset.id = String(b.id); // Task 7 (drag & drop) hooks onto data-id
+  // The dragged item stays in the list; its slot renders as the placeholder.
+  if (tileDnd && tileDnd.draggingId() === b.id) tile.classList.add('tile-source');
 
   const link = el('a', 'tile-link');
   link.href = b.url; // real anchor: Ctrl/Cmd/middle click opens a new tab natively
@@ -107,6 +128,9 @@ function makeTile(b) {
   });
   tile.addEventListener('contextmenu', (e) => {
     e.preventDefault();
+    // While a tile drag is armed or running (touch hold), the context menu
+    // — and our edit shortcut — must not pop over the drag.
+    if ((drag && drag.mode) || (tileDnd && tileDnd.active())) return;
     openBookmarkModal(b);
   });
 
@@ -154,7 +178,7 @@ function hashStr(s) {
 
 function renderDots() {
   els.dots.replaceChildren();
-  for (let i = 0; i < pageCount(); i++) {
+  for (let i = 0; i < displayPageCount(); i++) {
     const dot = el('button', 'dot');
     dot.type = 'button';
     dot.setAttribute('aria-label', `第 ${i + 1} 页`);
@@ -166,13 +190,13 @@ function renderDots() {
 
 function updateArrows() {
   els.navPrev.disabled = state.page <= 0;
-  els.navNext.disabled = state.page >= pageCount() - 1;
+  els.navNext.disabled = state.page >= displayPageCount() - 1;
 }
 
 // ---------- navigation ----------
 
 function goToPage(i) {
-  state.page = Math.min(Math.max(i, 0), pageCount() - 1);
+  state.page = Math.min(Math.max(i, 0), displayPageCount() - 1);
   sessionStorage.setItem(PAGE_KEY, String(state.page));
   offsetTrack(0, true);
   renderDots();
@@ -198,7 +222,7 @@ let wheelLastFire = -Infinity;
 let wheelResetTimer = 0;
 
 function onWheel(e) {
-  if (modalOpen() || (drag && drag.active)) return;
+  if (modalOpen() || (drag && drag.active) || (tileDnd && tileDnd.active())) return;
   e.preventDefault(); // block scroll-chaining and browser swipe-back
   const d = Math.abs(e.deltaX) >= Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
   wheelAcc += d;
@@ -217,9 +241,15 @@ const isEditable = (t) =>
   (t.isContentEditable || /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName));
 
 function onKeyDown(e) {
-  if (e.key === 'Escape' && modalOpen()) {
-    closeModal();
-    return;
+  if (e.key === 'Escape') {
+    if (tileDnd && tileDnd.active()) {
+      cancelTileDrag();
+      return;
+    }
+    if (modalOpen()) {
+      closeModal();
+      return;
+    }
   }
   if (modalOpen() || isEditable(e.target)) return;
   if (e.key === 'ArrowLeft') {
@@ -231,27 +261,79 @@ function onKeyDown(e) {
   }
 }
 
-// ---------- pointer swipe ----------
+// ---------- pointer gestures (swipe & tile drag) ----------
 
-let drag = null; // {pointerId, startX, startT, dx, active}
-let suppressClick = false; // swallow the click that follows a swipe
-let pressTimer = 0; // long-press timer (touch → edit modal)
+// One gesture at a time. mode: null = undecided, 'tile-pending' = press on
+// a tile not yet qualified as a drag, 'tile' = running tile drag (dnd.js),
+// active = running page swipe.
+let drag = null;
+let suppressClick = false; // swallow the click that follows a swipe or drag
+let pressTimer = 0; // touch/pen hold timer on a tile
 
 function onPointerDown(e) {
+  // A second finger arriving mid-gesture is ignored. Pending/inactive
+  // presses are simply replaced, which also heals a drag object orphaned
+  // by a pointerup the page never saw.
+  if (drag && (drag.active || drag.mode === 'tile')) return;
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
   cancelPress();
   suppressClick = false; // a new gesture clears any stale suppression
   if (modalOpen()) return;
-  if (e.pointerType === 'mouse' && e.button !== 0) return;
-  drag = { pointerId: e.pointerId, startX: e.clientX, startT: performance.now(), dx: 0, active: false };
-  // Long-press on a tile opens its edit modal (touch only; mouse uses ✎/right-click).
-  const tile = e.target.closest('.tile');
-  if (tile && e.pointerType === 'touch') {
-    pressTimer = setTimeout(() => {
-      suppressClick = true; // eat the click after the finger lifts
-      const b = state.bookmarks.find((x) => x.id === Number(tile.dataset.id));
-      if (b) openBookmarkModal(b);
-    }, LONG_PRESS_MS);
+  const tileEl = e.target.closest('.tile');
+  drag = {
+    pointerId: e.pointerId,
+    startX: e.clientX, startY: e.clientY,
+    lastX: e.clientX, lastY: e.clientY,
+    startT: performance.now(),
+    dx: 0, active: false, mode: null, tileId: 0,
+  };
+  // Swipe vs tile-drag rule: a press landing on a real tile (not on its ✎
+  // button, not the dashed drop slot) is a tile-drag CANDIDATE — it becomes
+  // a drag once the pointer moves >6px while held (mouse) or survives a
+  // 350ms hold (touch/pen). Any other press stays a page-swipe candidate,
+  // and a tile candidate that strays too far before its hold fires also
+  // converts to a swipe — so a flick on a tile still flips the page and a
+  // tap stays a link click. (A touch hold now drags instead of opening the
+  // editor; the always-visible ✎ button covers editing.)
+  if (tileEl && tileEl.dataset.id && !e.target.closest('.tile-edit')) {
+    drag.mode = 'tile-pending';
+    drag.tileId = Number(tileEl.dataset.id);
+    if (e.pointerType !== 'mouse') pressTimer = setTimeout(startTileDrag, TILE_HOLD_MS);
   }
+}
+
+// startTileDrag promotes a tile-pending press into a real drag. Called by
+// the hold timer (touch/pen) or by onPointerMove past the slop (mouse).
+function startTileDrag() {
+  if (!drag || drag.mode !== 'tile-pending') return;
+  const bm = tileDnd && state.bookmarks.find((b) => b.id === drag.tileId);
+  if (!bm) {
+    drag.mode = null; // can't drag — let the gesture fall back to a swipe
+    return;
+  }
+  cancelPress();
+  drag.mode = 'tile';
+  suppressClick = true; // the release click must not open the link
+  try {
+    els.viewport.setPointerCapture(drag.pointerId);
+  } catch {
+    // Pointer was already released in a lost-up race; keep going — the
+    // first move/end event will settle the gesture.
+  }
+  tileDnd.begin(drag.lastX, drag.lastY, bm);
+}
+
+// Esc during a tile drag: end the gesture and revert the list order.
+function cancelTileDrag() {
+  cancelPress();
+  if (drag) {
+    try {
+      els.viewport.releasePointerCapture(drag.pointerId);
+    } catch { /* pointer was never captured */ }
+    drag = null;
+  }
+  suppressClick = true; // eat the click when the held pointer releases
+  tileDnd.cancel();
 }
 
 function cancelPress() {
@@ -260,8 +342,29 @@ function cancelPress() {
 
 function onPointerMove(e) {
   if (!drag || e.pointerId !== drag.pointerId) return;
+  drag.lastX = e.clientX;
+  drag.lastY = e.clientY;
+  if (drag.mode === 'tile') {
+    tileDnd.move(e.clientX, e.clientY);
+    return;
+  }
   const dx = e.clientX - drag.startX;
   if (!drag.active) {
+    if (drag.mode === 'tile-pending') {
+      const dist = Math.hypot(dx, e.clientY - drag.startY);
+      if (e.pointerType === 'mouse') {
+        if (dist <= TILE_DRAG_SLOP) return;
+        startTileDrag();
+        return;
+      }
+      // Touch/pen: wandering too far before the hold fires forfeits the
+      // drag — the gesture can still become a page swipe below.
+      if (dist > HOLD_SLOP) {
+        cancelPress();
+        drag.mode = null;
+        suppressClick = true; // moved too far to count as a tap
+      }
+    }
     if (Math.abs(dx) < SWIPE_SLOP) return;
     drag.active = true;
     cancelPress();
@@ -275,8 +378,16 @@ function onPointerMove(e) {
 function onPointerEnd(e) {
   cancelPress();
   if (!drag || e.pointerId !== drag.pointerId) return;
-  const { dx, startT, active } = drag;
+  const { dx, startT, active, mode } = drag;
   drag = null;
+  if (mode === 'tile') {
+    suppressClick = true; // a drag is never a link click
+    if (tileDnd) {
+      if (e.type === 'pointercancel') tileDnd.cancel();
+      else tileDnd.drop();
+    }
+    return;
+  }
   if (!active) return;
   suppressClick = true;
   const w = els.viewport.clientWidth || 1;
@@ -288,7 +399,7 @@ function onPointerEnd(e) {
   goToPage(next); // snaps to next/prev or animates back to the current page
 }
 
-function onViewportClick(e) {
+function onClickCapture(e) {
   if (!suppressClick) return;
   suppressClick = false;
   e.preventDefault();
@@ -319,6 +430,16 @@ function showMsg(node, text, isError) {
 }
 
 const hideMsg = (node) => { node.hidden = true; };
+
+// ---------- toast ----------
+
+let toastTimer = 0;
+function showToast(text) {
+  els.toast.textContent = text;
+  els.toast.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { els.toast.hidden = true; }, 3500);
+}
 
 // ---------- bookmark modal ----------
 
@@ -449,6 +570,11 @@ function pollIcons() {
   let tries = 0;
   const tick = async () => {
     tries++;
+    // A running tile drag owns the list order; don't clobber it mid-gesture.
+    if (tileDnd && tileDnd.active()) {
+      if (tries < POLL_TRIES) pollTimer = setTimeout(tick, POLL_INTERVAL);
+      return;
+    }
     try {
       state.bookmarks = await api.listBookmarks();
       render();
@@ -462,12 +588,23 @@ function pollIcons() {
   pollTimer = setTimeout(tick, POLL_INTERVAL);
 }
 
+// ---------- tile drag & drop (dnd.js) ----------
+//
+// dnd.js registers its handlers through this hook so module imports stay
+// one-way (dnd.js → app.js); index.html loads both files. Every tileDnd
+// call site guards on it being non-null: if dnd.js fails to load, presses
+// on tiles just degrade to plain clicks.
+let tileDnd = null;
+export function registerTileDnd(handlers) { tileDnd = handlers; }
+
 // Task 7 hook: persist a new order as the full id list in display order
 // (tiles carry data-id; collect them left-to-right across pages).
 export async function persistOrder(ids) {
   state.bookmarks = await api.reorder(ids);
   render();
 }
+
+export { state, pageSize, render, goToPage, refresh, showToast };
 
 // ---------- events & boot ----------
 
@@ -484,7 +621,9 @@ function bindEvents() {
   els.viewport.addEventListener('pointermove', onPointerMove);
   els.viewport.addEventListener('pointerup', onPointerEnd);
   els.viewport.addEventListener('pointercancel', onPointerEnd);
-  els.viewport.addEventListener('click', onViewportClick, true);
+  // Clicks are captured at document level: a drop can end over the arrows
+  // or dots, which live outside the viewport element.
+  document.addEventListener('click', onClickCapture, true);
 
   els.formBookmark.addEventListener('submit', onBookmarkSubmit);
   els.bmCancel.addEventListener('click', closeModal);
@@ -511,7 +650,7 @@ async function init() {
     'modal-bookmark', 'modal-bookmark-title', 'form-bookmark', 'bm-title', 'bm-url',
     'bm-error', 'bm-delete', 'bm-refresh', 'bm-cancel',
     'modal-settings', 'set-rows', 'set-cols', 'set-msg',
-    'btn-export', 'btn-import', 'import-file', 'set-close',
+    'btn-export', 'btn-import', 'import-file', 'set-close', 'toast',
   ]) {
     els[id.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = document.getElementById(id);
   }
