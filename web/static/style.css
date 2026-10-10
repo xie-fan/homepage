@@ -1,0 +1,598 @@
+/* Homepage UI: light theme, automatic dark via prefers-color-scheme. */
+
+:root {
+  --bg-1: #eef2ff;
+  --bg-2: #f7f9ff;
+  --bg-3: #e2e8f8;
+  --fg: #1f2937;
+  --muted: #64748b;
+  --card: rgba(255, 255, 255, 0.85);
+  --field-bg: rgba(255, 255, 255, 0.85);
+  --border: #cbd5e1;
+  --accent: #4f6df5;
+  --accent-fg: #ffffff;
+  --danger: #dc2626;
+  /* Grid metrics — layout() in app.js writes these as resolved px on
+     :root (dnd.js parses --tile-w/--tile-h); the values here are the
+     desktop fallbacks before JS runs.
+     Sizing formula (per spacing preset: frac = target share of the
+     viewport width, gapShare = share of that target spent on column
+     gaps, gapMin/gapMax = gap range, tileMax = tile width cap,
+     rowMul = row-gap multiplier):
+       availW = vw − 2·padX      availH = vh − 2·padY
+       F      = min(availW, lerp(0.94 → frac) · vw)   target grid width
+                (the share eases toward near-full width below 1024px)
+       gapX   = clamp(gapMin, F·gapShare/(cols−1), gapMax)
+       gapY   = gapX · rowMul
+       tileW  = min(tileMax,
+                    (F      − (cols−1)·gapX) / cols,  fill the target
+                    (availW − (cols−1)·gapX) / cols,  never overflow
+                    rowFit / 0.92 and icon+label fit) height bound
+       tileH  = clamp(aspect·tileW, icon + label block, rowFit)
+       rowFit = (availH − (rows−1)·gapY) / rows
+       padX   = 64px while the side arrows overlay the grid (≥768px and
+                more than one page), 12px otherwise; padY = 12px.
+     Gaps shrink to gapMin before tiles give way, so the configured grid
+     (rows 3–5 × cols 4–6) always fits the viewport. Icon, label, edit
+     badge and link gap derive from --tile-w via clamp(). */
+  --tile-w: 106px;
+  --tile-h: 98px;
+  --grid-gap-x: 32px;
+  --grid-gap-y: 32px;
+  --page-pad-x: 64px;
+  --page-pad-y: 12px;
+  --icon: clamp(36px, calc(var(--tile-w) * 0.62), 72px);
+  --title-fs: clamp(12px, calc(var(--tile-w) * 0.125), 14px);
+  --edit-sz: clamp(20px, calc(var(--tile-w) * 0.24), 26px);
+  --radius: 14px;
+  --shadow: 0 4px 16px rgba(30, 41, 59, 0.1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-1: #0b1220;
+    --bg-2: #101a2e;
+    --bg-3: #0f172a;
+    --fg: #e2e8f0;
+    --muted: #94a3b8;
+    --card: rgba(30, 41, 59, 0.92);
+    --field-bg: rgba(15, 23, 42, 0.6);
+    --border: #3b4a63;
+    --shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  color: var(--fg);
+  background: linear-gradient(150deg, var(--bg-1), var(--bg-2) 45%, var(--bg-3));
+  background-attachment: fixed;
+  overflow-x: clip; /* belt & suspenders: nothing may scroll horizontally */
+}
+
+/* ---------- header ---------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+}
+
+.topbar-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+
+.topbar-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ---------- buttons ---------- */
+
+.btn {
+  padding: 8px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--fg);
+  font-size: 14px;
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.05s;
+}
+
+.btn:hover {
+  border-color: var(--accent);
+}
+
+.btn:active {
+  transform: scale(0.97);
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+.btn-danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+.btn-icon {
+  padding: 8px 11px;
+}
+
+/* ---------- app / paging ---------- */
+
+#app {
+  flex: 1;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.viewport {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  touch-action: pan-y pinch-zoom;
+}
+
+.track {
+  display: flex;
+  height: 100%;
+  transition: transform 0.32s ease;
+  will-change: transform;
+}
+
+.track.no-anim {
+  transition: none;
+}
+
+.page {
+  flex: 0 0 100%;
+  display: grid;
+  justify-content: center;
+  align-content: center;
+  /* --cols/--rows are set inline on each page by renderTrack(); the
+     metrics vars come from :root via layout(). */
+  --cols: 6;
+  --rows: 4;
+  grid-template-columns: repeat(var(--cols), var(--tile-w));
+  grid-template-rows: repeat(var(--rows), var(--tile-h));
+  gap: var(--grid-gap-y) var(--grid-gap-x);
+  padding: var(--page-pad-y) var(--page-pad-x);
+}
+
+.empty {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 40px 0;
+  color: var(--muted);
+  font-size: 15px;
+  text-align: center;
+}
+
+/* ---------- tiles ---------- */
+
+.tile {
+  position: relative;
+  width: var(--tile-w);
+  height: var(--tile-h);
+  /* Touches starting on a tile never become a native pan, so the browser
+     can't steal the long-press → drag gesture (pinch-zoom stays allowed).
+     Selection/callout are off so a hold doesn't highlight the title. */
+  touch-action: pinch-zoom;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.tile-link {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: clamp(4px, calc(var(--tile-w) * 0.08), 10px);
+  height: 100%;
+  padding-top: 2px;
+  text-decoration: none;
+  color: var(--fg);
+  border-radius: var(--radius);
+}
+
+.tile-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.tile-icon {
+  width: var(--icon);
+  height: var(--icon);
+  border-radius: calc(var(--icon) * 0.28);
+  overflow: hidden;
+  box-shadow: var(--shadow);
+}
+
+.tile-icon img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.avatar {
+  width: var(--icon);
+  height: var(--icon);
+  border-radius: calc(var(--icon) * 0.28);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: calc(var(--icon) * 0.44);
+  font-weight: 600;
+  box-shadow: var(--shadow);
+  user-select: none;
+}
+
+.tile-title {
+  max-width: 100%;
+  font-size: var(--title-fs);
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tile-edit {
+  position: absolute;
+  top: calc(var(--edit-sz) * -0.29);
+  right: calc(var(--edit-sz) * -0.29);
+  z-index: 2;
+  width: var(--edit-sz);
+  height: var(--edit-sz);
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--fg);
+  font-size: calc(var(--edit-sz) * 0.54);
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.tile:hover .tile-edit,
+.tile:focus-within .tile-edit {
+  opacity: 1;
+}
+
+/* Touch devices have no hover: keep the affordance faintly visible. */
+@media (hover: none) {
+  .tile-edit {
+    opacity: 0.85;
+  }
+}
+
+/* Freshly added tile: app.js tags it .tile-new for ~1.5s so the pulse
+   draws the eye to where the bookmark landed. */
+.tile-new .tile-link {
+  outline: 3px solid transparent;
+  outline-offset: 2px;
+  animation: tile-new-pulse 0.75s ease-in-out 2;
+}
+
+@keyframes tile-new-pulse {
+  50% {
+    outline-color: var(--accent);
+  }
+}
+
+/* ---------- drag & drop ---------- */
+
+/* The dragged item's slot collapses to a dashed placeholder; it moves
+   through the grid as the item is live-reordered. */
+.tile.tile-source {
+  border-radius: var(--radius);
+  outline: 2px dashed var(--accent);
+  outline-offset: -3px;
+}
+
+.tile.tile-source .tile-link,
+.tile.tile-source .tile-edit {
+  visibility: hidden;
+}
+
+/* Floating clone that follows the pointer (positioned inline in dnd.js
+   by a rAF loop). Two invariants live here so they can't regress: it is
+   pointer-events:none (hit-testing for drop targets must always see
+   through it) and it never transitions — any transform animation would
+   make the ghost trail the pointer. */
+.drag-clone {
+  pointer-events: none;
+  transition: none !important;
+  border-radius: var(--radius);
+  background: var(--card);
+  box-shadow: 0 14px 34px rgba(15, 23, 42, 0.3);
+  cursor: grabbing;
+}
+
+body.dnd-active,
+body.dnd-active * {
+  cursor: grabbing !important;
+}
+
+/* While a drag dwells in an edge zone, a soft gradient marks the side
+   that is about to flip pages (dnd.js toggles the body classes). */
+.viewport::before,
+.viewport::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 4; /* above tiles, below the nav arrows (z-index 5) */
+  width: max(56px, 8%); /* mirrors edgeZonePx() in dnd.js */
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.viewport::before {
+  left: 0;
+  background: linear-gradient(to right, rgba(79, 109, 245, 0.18), transparent);
+  background: linear-gradient(to right,
+    color-mix(in srgb, var(--accent) 18%, transparent), transparent);
+}
+
+.viewport::after {
+  right: 0;
+  background: linear-gradient(to left, rgba(79, 109, 245, 0.18), transparent);
+  background: linear-gradient(to left,
+    color-mix(in srgb, var(--accent) 18%, transparent), transparent);
+}
+
+body.dnd-edge-left .viewport::before,
+body.dnd-edge-right .viewport::after {
+  opacity: 1;
+}
+
+/* ---------- arrows & dots ---------- */
+
+/* The pager row sits below the viewport: ‹  • • •  ›. On narrow screens
+   the arrows are ordinary flex items next to the dots; at ≥768px they
+   become absolute overlays in the page side gutters (see media query).
+   layout() reads back the computed position to decide how much gutter
+   the grid must reserve — one source of truth, no mirrored breakpoint. */
+.pager {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  padding: 12px 0 18px;
+}
+
+.nav-arrow {
+  flex: 0 0 auto; /* disabled arrows stay invisible but keep dots centered */
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--fg);
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.nav-arrow:disabled {
+  opacity: 0;
+  pointer-events: none;
+}
+
+@media (min-width: 768px) {
+  .nav-arrow {
+    position: absolute; /* overlays #app: .pager is not positioned */
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 5;
+  }
+
+  .nav-prev {
+    left: 14px;
+  }
+
+  .nav-next {
+    right: 14px;
+  }
+}
+
+.dots {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--muted);
+  opacity: 0.35;
+  cursor: pointer;
+}
+
+.dot.active {
+  opacity: 1;
+  background: var(--accent);
+  transform: scale(1.25);
+}
+
+/* ---------- modals ---------- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.modal-backdrop[hidden] {
+  display: none;
+}
+
+.modal {
+  width: min(92vw, 400px);
+  padding: 22px;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  box-shadow: 0 16px 48px rgba(15, 23, 42, 0.28);
+  color: var(--fg);
+}
+
+.modal h2 {
+  margin: 0 0 18px;
+  font-size: 17px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+  font-size: 14px;
+}
+
+.field input,
+.field select {
+  padding: 9px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--field-bg);
+  color: var(--fg);
+  font-size: 14px;
+}
+
+.field input:focus,
+.field select:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.field input[type="file"] {
+  max-width: 100%;
+  font-size: 13px;
+}
+
+.field-row {
+  display: flex;
+  gap: 12px;
+}
+
+.field-row .field {
+  flex: 1;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.radio-row {
+  font-size: 14px;
+}
+
+.radio-row label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.modal-actions .spacer {
+  flex: 1;
+}
+
+.modal-msg {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.modal-msg.error {
+  color: var(--danger);
+}
+
+/* ---------- toast ---------- */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 30px;
+  z-index: 80;
+  transform: translateX(-50%);
+  max-width: 88vw;
+  padding: 10px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--fg);
+  color: var(--bg-2);
+  font-size: 14px;
+  box-shadow: var(--shadow);
+}
+
+.toast[hidden] {
+  display: none;
+}
+
+/* ---------- motion ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .track {
+    transition: none;
+  }
+  /* No pulse: a static accent ring marks the new tile for the same
+     ~1.5s window (app.js removes .tile-new on a timer). */
+  .tile-new .tile-link {
+    animation: none;
+    outline-color: var(--accent);
+  }
+}
