@@ -21,12 +21,19 @@ func hostKey(pageURL string) string {
 	return strings.ToLower(u.Hostname())
 }
 
+// hostFilePrefix is the name stem every icon file for a host shares:
+// <sha256(host)[:32]>. All cached files for the host match
+// "<prefix>.*" in the icons dir.
+func hostFilePrefix(host string) string {
+	sum := sha256.Sum256([]byte(host))
+	return hex.EncodeToString(sum[:])[:32]
+}
+
 // iconFileName derives the cache file name for a page URL:
 // <sha256(host)[:32]>.<ext>. Host-keyed names deduplicate icons across
 // bookmarks that point at the same site.
 func iconFileName(pageURL, ext string) string {
-	sum := sha256.Sum256([]byte(hostKey(pageURL)))
-	return hex.EncodeToString(sum[:])[:32] + "." + ext
+	return hostFilePrefix(hostKey(pageURL)) + "." + ext
 }
 
 // extForContentType maps an icon content type to a file extension.

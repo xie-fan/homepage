@@ -21,16 +21,12 @@ const (
 	queueSize  = 256
 )
 
-// iconReuseMaxAge bounds how old a sibling's cached icon file may be to
-// be adopted instead of refetching. The API has a single Enqueue entry
-// point for both ordinary fetches and explicit "refresh icon" requests
-// (the refresh handler resets the icon to empty/pending first, so
-// a refresh looks exactly like a normal pending job by the time it is
-// dequeued — no force flag can reach the worker). Bounding reuse by
-// file age is what keeps refresh meaningful: a fresh sibling icon is
-// adopted, anything older is refetched. And because reuse needs a
-// different bookmark with status ok, refreshing the only bookmark on a
-// host always hits the network.
+// iconReuseMaxAge bounds how old a cached host-keyed icon file may be
+// to be adopted instead of refetching: icon files outlive the bookmarks
+// that produced them (nothing deletes them on update/delete/replace),
+// so any fresh file matching the bookmark's host is reused. Explicit
+// refreshes bypass this check via EnqueueForce, and a file older than
+// the cap is refetched rather than adopted.
 const iconReuseMaxAge = 7 * 24 * time.Hour
 
 // Service is the async icon-fetching worker behind api.IconService.
@@ -49,14 +45,21 @@ type Service struct {
 	done   sync.Once
 
 	queue chan int64
-	// inflight maps a queued/running bookmark id to the newest URL it
+	// inflight maps a queued/running bookmark id to the newest job it
 	// was enqueued with, deduplicating repeat enqueues.
 	mu       sync.Mutex
-	inflight map[int64]string
+	inflight map[int64]iconJob
 	// flights holds one in-flight fetch per host (hostKey): jobs for
 	// the same host join the running flight and share its outcome
 	// instead of fetching in parallel.
 	flights map[string]*hostFlight
+}
+
+// iconJob is one queued fetch: the page URL enqueued for a bookmark and
+// whether the cache must be bypassed (an explicit refresh).
+type iconJob struct {
+	url   string
+	force bool
 }
 
 // fetchResult is the outcome of one icon fetch, shared with every
@@ -92,7 +95,7 @@ func NewService(bs store.BookmarkStore, f *Fetcher, dataDir string, logger *slog
 		ctx:      ctx,
 		cancel:   cancel,
 		queue:    make(chan int64, queueSize),
-		inflight: make(map[int64]string),
+		inflight: make(map[int64]iconJob),
 		flights:  make(map[string]*hostFlight),
 	}, nil
 }
@@ -121,17 +124,34 @@ func (s *Service) Start(ctx context.Context) error {
 	return nil
 }
 
-// Enqueue queues an icon fetch for the bookmark without blocking.
+// Enqueue queues an icon fetch for the bookmark without blocking; a
+// fresh cached file for the host is adopted instead of fetching.
 // Re-enqueues of an in-flight id coalesce to the newest URL; when the
 // queue is full the fetch is dropped and logged.
 func (s *Service) Enqueue(id int64, pageURL string) {
+	s.enqueue(id, pageURL, false)
+}
+
+// EnqueueForce is Enqueue for an explicit refresh: the job always hits
+// the network and overwrites the host's cached icon file instead of
+// adopting it. A forced re-enqueue also upgrades a queued normal job.
+func (s *Service) EnqueueForce(id int64, pageURL string) {
+	s.enqueue(id, pageURL, true)
+}
+
+// enqueue records the job and pushes the id to the worker pool.
+// Re-enqueues of an in-flight id coalesce to the newest URL; force is
+// sticky so an explicit refresh is never downgraded by a pending job.
+func (s *Service) enqueue(id int64, pageURL string, force bool) {
 	s.mu.Lock()
-	if _, dup := s.inflight[id]; dup {
-		s.inflight[id] = pageURL
+	if job, dup := s.inflight[id]; dup {
+		job.url = pageURL
+		job.force = job.force || force
+		s.inflight[id] = job
 		s.mu.Unlock()
 		return
 	}
-	s.inflight[id] = pageURL
+	s.inflight[id] = iconJob{url: pageURL, force: force}
 	s.mu.Unlock()
 
 	select {
@@ -185,20 +205,20 @@ func (s *Service) worker() {
 			return
 		case id := <-s.queue:
 			s.mu.Lock()
-			url := s.inflight[id]
+			job := s.inflight[id]
 			delete(s.inflight, id)
 			s.mu.Unlock()
-			s.process(id, url)
+			s.process(id, job)
 		}
 	}
 }
 
-// process resolves the icon for one bookmark: it first tries to adopt
-// a sibling bookmark's fresh cached icon for the same host (icon files
-// are host-keyed, so the sibling's file is the exact name a fetch here
-// would write anyway), otherwise it joins — or leads — the per-host
-// fetch flight.
-func (s *Service) process(id int64, pageURL string) {
+// process resolves the icon for one bookmark: unless the job is forced
+// (explicit refresh) it first tries to adopt a fresh host-keyed icon
+// file already in the icons dir — icon files survive their bookmarks,
+// so a replace-import or re-added bookmark reuses them without any
+// network — otherwise it joins — or leads — the per-host fetch flight.
+func (s *Service) process(id int64, job iconJob) {
 	ctx := s.ctx
 	b, err := s.store.Get(ctx, id)
 	if err != nil {
@@ -207,7 +227,7 @@ func (s *Service) process(id int64, pageURL string) {
 		}
 		return // deleted or unreadable: nothing to do
 	}
-	if b.URL != pageURL {
+	if b.URL != job.url {
 		return // URL changed since enqueue; a newer job owns the fetch
 	}
 
@@ -215,12 +235,14 @@ func (s *Service) process(id int64, pageURL string) {
 	if host == "" {
 		// Shouldn't happen (the API validates absolute http/https
 		// URLs); without a host key there is nothing to dedupe on.
-		s.commitIfCurrent(ctx, id, pageURL, s.fetchAndStore(ctx, id, b.URL))
+		s.commitIfCurrent(ctx, id, job.url, s.fetchAndStore(ctx, id, b.URL))
 		return
 	}
-	if name, ok := s.reusableIcon(ctx, id, host); ok {
-		s.setIcon(id, name, store.IconOK)
-		return
+	if !job.force {
+		if name, ok := s.cachedIcon(host); ok {
+			s.setIcon(id, name, store.IconOK)
+			return
+		}
 	}
 
 	fl, leader := s.flightFor(host)
@@ -230,44 +252,47 @@ func (s *Service) process(id int64, pageURL string) {
 		case <-s.ctx.Done():
 			return
 		}
-		s.commitIfCurrent(ctx, id, pageURL, fl.res)
+		s.commitIfCurrent(ctx, id, job.url, fl.res)
 		return
 	}
 	// The reuse check runs again inside the flight: a previous flight
 	// for this host may have committed between our first check and
 	// flight registration.
 	var res fetchResult
-	if name, ok := s.reusableIcon(ctx, id, host); ok {
-		res = fetchResult{name: name, status: store.IconOK}
-	} else {
+	if !job.force {
+		if name, ok := s.cachedIcon(host); ok {
+			res = fetchResult{name: name, status: store.IconOK}
+		}
+	}
+	if res.status == "" {
 		res = s.fetchAndStore(ctx, id, b.URL)
 	}
 	// Commit before publishing: a job that misses the flight and leads
 	// the next one must already find this icon in its reuse check.
-	s.commitIfCurrent(ctx, id, pageURL, res)
+	s.commitIfCurrent(ctx, id, job.url, res)
 	s.finishFlight(host, fl, res)
 }
 
-// reusableIcon returns the icon file name a different bookmark on the
-// same host already fetched — status ok, the file on disk, written less
-// than iconReuseMaxAge ago. Reporting false sends the caller to the
-// network. A stale sibling file (older than the cap) is not adopted, so
-// an aged icon — or an explicit refresh — still refetches.
-func (s *Service) reusableIcon(ctx context.Context, id int64, host string) (string, bool) {
-	bs, err := s.store.List(ctx)
+// cachedIcon returns the host-keyed icon file already sitting in the
+// icons dir — any known extension, written less than iconReuseMaxAge
+// ago — or false, sending the caller to the network. Because the file
+// name is derived from the host alone, a bookmark orphaned by a delete
+// or replace still reuses it; no sibling bookmark is needed.
+func (s *Service) cachedIcon(host string) (string, bool) {
+	prefix := hostFilePrefix(host) + "."
+	matches, err := filepath.Glob(filepath.Join(s.dir, prefix+"*"))
 	if err != nil {
 		return "", false
 	}
-	for _, b := range bs {
-		if b.ID == id || b.IconStatus != store.IconOK || b.IconPath == "" {
+	for _, m := range matches {
+		name := filepath.Base(m)
+		// Only files the cache itself could have produced count:
+		// <hash>.<ext> with an extension-safe body.
+		if !isNameChar(name[len(prefix):]) {
 			continue
 		}
-		if hostKey(b.URL) != host {
-			continue
-		}
-		name := filepath.Base(b.IconPath)
-		st, err := os.Stat(filepath.Join(s.dir, name))
-		if err != nil || time.Since(st.ModTime()) > iconReuseMaxAge {
+		st, err := os.Stat(m)
+		if err != nil || st.IsDir() || time.Since(st.ModTime()) > iconReuseMaxAge {
 			continue
 		}
 		return name, true

@@ -14,16 +14,22 @@ import (
 // tests substitute a fake.
 type IconService interface {
 	// Enqueue queues an icon fetch for the bookmark; it must not block.
+	// A fresh cached file for the bookmark's host may be adopted instead
+	// of hitting the network.
 	Enqueue(id int64, pageURL string)
+	// EnqueueForce queues a fetch that always hits the network,
+	// bypassing and overwriting the host's cached icon file.
+	EnqueueForce(id int64, pageURL string)
 	// IconFile returns the cached icon file for b and its content type.
 	IconFile(ctx context.Context, b store.Bookmark) (path, contentType string, err error)
 }
 
 // NopIcons is the placeholder IconService used until the favicon worker
-// exists: Enqueue does nothing and IconFile reports a missing file.
+// exists: enqueues do nothing and IconFile reports a missing file.
 type NopIcons struct{}
 
-func (NopIcons) Enqueue(int64, string) {}
+func (NopIcons) Enqueue(int64, string)      {}
+func (NopIcons) EnqueueForce(int64, string) {}
 
 func (NopIcons) IconFile(context.Context, store.Bookmark) (string, string, error) {
 	return "", "", fs.ErrNotExist

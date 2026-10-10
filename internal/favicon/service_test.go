@@ -384,10 +384,10 @@ func TestServiceDifferentHostsSeparateIcons(t *testing.T) {
 	}
 }
 
-func TestServiceStaleSiblingIconRefetches(t *testing.T) {
-	// A sibling icon older than iconReuseMaxAge is not adopted: the
-	// second bookmark refetches (and rewrites the same host-keyed
-	// file) — this is also the refresh path for aged icons.
+func TestServiceStaleHostFileRefetches(t *testing.T) {
+	// A cached host file older than iconReuseMaxAge is not adopted:
+	// the second bookmark refetches (and rewrites the same host-keyed
+	// file) — this is also the path for aged icons.
 	env := newTestEnv(t)
 	ctx := context.Background()
 	src := newCountingIconServer(t)
@@ -423,8 +423,8 @@ func TestServiceStaleSiblingIconRefetches(t *testing.T) {
 	}
 }
 
-func TestServiceMissingSiblingFileRefetches(t *testing.T) {
-	// Reuse requires the sibling's file on disk; a status-ok row whose
+func TestServiceMissingHostFileRefetches(t *testing.T) {
+	// Reuse requires the host's file on disk; a status-ok row whose
 	// file vanished does not count.
 	env := newTestEnv(t)
 	ctx := context.Background()
@@ -455,10 +455,55 @@ func TestServiceMissingSiblingFileRefetches(t *testing.T) {
 	}
 }
 
+// TestServiceAdoptsHostFileAfterReplace: a replace-import wipes every
+// bookmark row but leaves the host-keyed icon files, so a re-imported
+// bookmark on the same host adopts the cached file — no sibling with
+// status ok needed and no network request.
+func TestServiceAdoptsHostFileAfterReplace(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+	src := newCountingIconServer(t)
+
+	if err := env.svc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	b1, err := env.st.Create(ctx, "t", src.srv.URL+"/a")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	env.svc.Enqueue(b1.ID, b1.URL)
+	b1 = waitStatus(t, env.st.BookmarkStore, b1.ID, store.IconOK)
+
+	// ReplaceAll wipes the rows (the import replace path); the icon
+	// file itself must survive.
+	created, err := env.st.ReplaceAll(ctx,
+		[]store.NewBookmark{{Title: "t", URL: src.srv.URL + "/b"}})
+	if err != nil {
+		t.Fatalf("ReplaceAll: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(env.iconDir, b1.IconPath)); err != nil {
+		t.Fatalf("icon file lost across replace: %v", err)
+	}
+
+	b2 := created[0]
+	env.svc.Enqueue(b2.ID, b2.URL)
+	b2 = waitStatus(t, env.st.BookmarkStore, b2.ID, store.IconOK)
+
+	if b2.IconPath != b1.IconPath {
+		t.Fatalf("b2 icon = %q, want adopted %q", b2.IconPath, b1.IconPath)
+	}
+	if got := src.pageHits.Load(); got != 1 {
+		t.Fatalf("page requests = %d, want 1 (cached host file not reused)", got)
+	}
+	if got := src.iconHits.Load(); got != 1 {
+		t.Fatalf("icon requests = %d, want 1", got)
+	}
+}
+
 func TestServiceRefreshSoleBookmarkRefetches(t *testing.T) {
-	// POST .../icon/refresh resets icon_path/status then calls the same
-	// Enqueue. With no sibling holding the host's icon there is nothing
-	// to reuse, so the refresh always hits the network again.
+	// POST .../icon/refresh resets icon_path/status then calls
+	// EnqueueForce. Even though a fresh host-keyed file is cached, the
+	// forced job bypasses it and hits the network again.
 	env := newTestEnv(t)
 	ctx := context.Background()
 	src := newCountingIconServer(t)
@@ -476,13 +521,28 @@ func TestServiceRefreshSoleBookmarkRefetches(t *testing.T) {
 		t.Fatalf("page requests = %d, want 1", got)
 	}
 
-	// Mirror internal/api's refreshIcon handler: reset, then Enqueue.
+	// Corrupt the cached file: a forced refetch must overwrite it with
+	// the real icon again rather than adopt it.
+	iconFile := filepath.Join(env.iconDir, b.IconPath)
+	if err := os.WriteFile(iconFile, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Mirror internal/api's refreshIcon handler: reset, then
+	// EnqueueForce.
 	if err := env.st.SetIcon(ctx, b.ID, "", store.IconPending); err != nil {
 		t.Fatalf("SetIcon: %v", err)
 	}
-	env.svc.Enqueue(b.ID, b.URL)
-	waitStatus(t, env.st.BookmarkStore, b.ID, store.IconOK)
+	env.svc.EnqueueForce(b.ID, b.URL)
+	b = waitStatus(t, env.st.BookmarkStore, b.ID, store.IconOK)
 	if got := src.pageHits.Load(); got != 2 {
-		t.Fatalf("page requests = %d, want 2 (refresh did not refetch)", got)
+		t.Fatalf("page requests = %d, want 2 (forced refresh did not refetch)", got)
+	}
+	raw, err := os.ReadFile(iconFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(raw, png1x1) {
+		t.Fatal("cached host file not overwritten by forced refetch")
 	}
 }

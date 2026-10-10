@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,7 +66,9 @@ func (s *server) exportBookmarks(w http.ResponseWriter, r *http.Request) {
 // importBookmarks imports the export shape — or a bare [{title,url}]
 // array — either appending (default) or replacing all bookmarks. The
 // whole import is rejected on the first invalid item. Embedded settings
-// apply only in replace mode. Imported bookmarks get icon fetches queued.
+// apply only in replace mode. Append mode skips items whose normalized
+// URL is already bookmarked or repeats an earlier item; replace mode
+// imports the file verbatim. Imported bookmarks get icon fetches queued.
 func (s *server) importBookmarks(w http.ResponseWriter, r *http.Request) {
 	mode := r.URL.Query().Get("mode")
 	if mode == "" {
@@ -98,6 +101,15 @@ func (s *server) importBookmarks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	skipped := 0
+	if mode == "append" {
+		var err error
+		items, skipped, err = s.dropDuplicateItems(ctx, items)
+		if err != nil {
+			s.handleErr(w, r, err)
+			return
+		}
+	}
 	if mode == "replace" && settings != nil {
 		if err := settings.Grid.Validate(); err != nil {
 			writeErr(w, badInput(codeInvalidGrid, "grid", fmt.Sprintf("settings: %s", err)))
@@ -123,7 +135,32 @@ func (s *server) importBookmarks(w http.ResponseWriter, r *http.Request) {
 	for _, b := range created {
 		s.icons.Enqueue(b.ID, b.URL)
 	}
-	writeJSON(w, http.StatusOK, map[string]int{"imported": len(created)})
+	writeJSON(w, http.StatusOK, map[string]int{"imported": len(created), "skipped": skipped})
+}
+
+// dropDuplicateItems filters items down to those whose normalized URL
+// is not already bookmarked and did not appear earlier in items,
+// reporting how many were dropped. Append-mode imports only: replace
+// mode must reproduce the file exactly.
+func (s *server) dropDuplicateItems(ctx context.Context, items []store.NewBookmark) ([]store.NewBookmark, int, error) {
+	bs, err := s.store.List(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	seen := make(map[string]bool, len(bs)+len(items))
+	for _, b := range bs {
+		seen[NormalizeURL(b.URL)] = true
+	}
+	var kept []store.NewBookmark
+	for _, nb := range items {
+		n := NormalizeURL(nb.URL)
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		kept = append(kept, nb)
+	}
+	return kept, len(items) - len(kept), nil
 }
 
 // decodeImportBody reads the import payload: either the export object or

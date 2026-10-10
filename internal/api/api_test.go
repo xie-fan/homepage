@@ -21,7 +21,8 @@ import (
 	"homepage/internal/store"
 )
 
-// fakeIcons records Enqueue calls and returns a canned IconFile result.
+// fakeIcons records Enqueue/EnqueueForce calls and returns a canned
+// IconFile result.
 type fakeIcons struct {
 	mu       sync.Mutex
 	enqueued []enqueuedIcon
@@ -31,14 +32,23 @@ type fakeIcons struct {
 }
 
 type enqueuedIcon struct {
-	id  int64
-	url string
+	id    int64
+	url   string
+	force bool
 }
 
 func (f *fakeIcons) Enqueue(id int64, pageURL string) {
+	f.enqueue(id, pageURL, false)
+}
+
+func (f *fakeIcons) EnqueueForce(id int64, pageURL string) {
+	f.enqueue(id, pageURL, true)
+}
+
+func (f *fakeIcons) enqueue(id int64, pageURL string, force bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.enqueued = append(f.enqueued, enqueuedIcon{id, pageURL})
+	f.enqueued = append(f.enqueued, enqueuedIcon{id, pageURL, force})
 }
 
 func (f *fakeIcons) IconFile(context.Context, store.Bookmark) (string, string, error) {
@@ -47,7 +57,7 @@ func (f *fakeIcons) IconFile(context.Context, store.Bookmark) (string, string, e
 	return f.path, f.ct, f.err
 }
 
-// calls returns a copy of the recorded Enqueue calls.
+// calls returns a copy of the recorded Enqueue/EnqueueForce calls.
 func (f *fakeIcons) calls() []enqueuedIcon {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -478,7 +488,7 @@ func TestExportImportRoundtrip(t *testing.T) {
 	srv2, _, icons2 := newTestServer(t)
 	var res map[string]int
 	code := reqRaw(t, srv2, http.MethodPost, "/api/import?mode=replace", string(raw), &res)
-	if code != http.StatusOK || res["imported"] != 2 {
+	if code != http.StatusOK || res["imported"] != 2 || res["skipped"] != 0 {
 		t.Fatalf("replace import = %d %v", code, res)
 	}
 	if got := listTitles(t, srv2); !slices.Equal(got, []string{"a", "b"}) {
@@ -494,18 +504,21 @@ func TestExportImportRoundtrip(t *testing.T) {
 		t.Fatalf("enqueued = %v, want 2 calls", got)
 	}
 
-	// Append (the default mode) adds without wiping, and ignores settings
-	// embedded in the payload.
+	// Append (the default mode) adds without wiping, ignores settings
+	// embedded in the payload, and skips items already bookmarked —
+	// here the two repeats, while the new entry imports.
 	doc.Settings = store.Settings{Grid: store.Grid{Rows: 5, Cols: 6}}
+	doc.Bookmarks = append(doc.Bookmarks,
+		store.NewBookmark{Title: "c", URL: "https://c.example.com"})
 	raw2, err := json.Marshal(doc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	code = reqRaw(t, srv2, http.MethodPost, "/api/import", string(raw2), &res)
-	if code != http.StatusOK || res["imported"] != 2 {
+	if code != http.StatusOK || res["imported"] != 1 || res["skipped"] != 2 {
 		t.Fatalf("append import = %d %v", code, res)
 	}
-	if got := listTitles(t, srv2); !slices.Equal(got, []string{"a", "b", "a", "b"}) {
+	if got := listTitles(t, srv2); !slices.Equal(got, []string{"a", "b", "c"}) {
 		t.Fatalf("after append = %v", got)
 	}
 	reqJSON(t, srv2, http.MethodGet, "/api/settings", nil, &st)
@@ -519,7 +532,7 @@ func TestImportBareArray(t *testing.T) {
 	var res map[string]int
 	code := reqRaw(t, srv, http.MethodPost, "/api/import",
 		`[{"title":"x","url":"https://x.example.com"},{"url":"https://y.example.com"}]`, &res)
-	if code != http.StatusOK || res["imported"] != 2 {
+	if code != http.StatusOK || res["imported"] != 2 || res["skipped"] != 0 {
 		t.Fatalf("import = %d %v", code, res)
 	}
 	// The item without a title got the host default.
@@ -587,11 +600,14 @@ func TestImportValidation(t *testing.T) {
 	}
 }
 
-// TestImportReplaceInvalidSettings: present-but-invalid settings reject
-// the import in replace mode.
+// TestImportReplaceInvalidSettings: a present-but-invalid grid rejects
+// the import in replace mode before any bookmark is deleted.
 func TestImportReplaceInvalidSettings(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	postBookmark(t, srv, "keep", "https://keep.example.com")
+	grid := store.Settings{Grid: store.Grid{Rows: 3, Cols: 5}}
+	reqJSON(t, srv, http.MethodPut, "/api/settings", grid, nil)
+
 	body := `{"settings":{"grid":{"rows":99,"cols":5}},"bookmarks":[{"url":"https://x.example.com"}]}`
 	var out errBody
 	if code := reqRaw(t, srv, http.MethodPost, "/api/import?mode=replace", body, &out); code != http.StatusBadRequest {
@@ -600,9 +616,14 @@ func TestImportReplaceInvalidSettings(t *testing.T) {
 	if out.Code != codeInvalidGrid {
 		t.Fatalf("code = %q, want %q", out.Code, codeInvalidGrid)
 	}
-	// Nothing was replaced.
+	// Nothing was replaced and the stored settings are untouched.
 	if got := listTitles(t, srv); !slices.Equal(got, []string{"keep"}) {
 		t.Fatalf("list = %v", got)
+	}
+	var st store.Settings
+	reqJSON(t, srv, http.MethodGet, "/api/settings", nil, &st)
+	if st != grid {
+		t.Fatalf("settings = %+v, want %+v", st, grid)
 	}
 }
 
@@ -672,8 +693,11 @@ func TestIconRefresh(t *testing.T) {
 	if code != http.StatusAccepted || out.IconStatus != store.IconPending || out.IconPath != "" {
 		t.Fatalf("refresh = %d %+v, want 202 pending", code, out)
 	}
-	if got := icons.calls(); len(got) != 1 || got[0].id != b.ID || got[0].url != b.URL {
-		t.Fatalf("enqueued = %v", got)
+	// Refresh must go through EnqueueForce so the worker bypasses the
+	// cached host file.
+	if got := icons.calls(); len(got) != 1 || got[0].id != b.ID ||
+		got[0].url != b.URL || !got[0].force {
+		t.Fatalf("enqueued = %v, want one forced call for %+v", got, b)
 	}
 	// The pending state was persisted, not just reported.
 	got, err := st.BookmarkStore.Get(ctx, b.ID)
@@ -871,20 +895,73 @@ func TestDuplicateUpdate(t *testing.T) {
 	}
 }
 
-// TestImportAllowsDuplicates: the import path is exempt from duplicate
-// detection.
-func TestImportAllowsDuplicates(t *testing.T) {
-	srv, _, _ := newTestServer(t)
+// TestImportAppendSkipsDuplicates: append-mode import skips items whose
+// normalized URL is already bookmarked or repeats an earlier item in
+// the same file, and reports how many were skipped.
+func TestImportAppendSkipsDuplicates(t *testing.T) {
+	srv, _, icons := newTestServer(t)
 	postBookmark(t, srv, "a", "https://a.example.com")
 
 	var res map[string]int
-	code := reqRaw(t, srv, http.MethodPost, "/api/import",
-		`[{"title":"dup","url":"https://A.example.com/"}]`, &res)
-	if code != http.StatusOK || res["imported"] != 1 {
-		t.Fatalf("import = %d %v, want 200 imported=1", code, res)
+	code := reqRaw(t, srv, http.MethodPost, "/api/import?mode=append",
+		`[{"title":"dup","url":"https://A.example.com/"},
+		  {"title":"b","url":"https://b.example.com"},
+		  {"title":"b2","url":"https://b.example.com:443"},
+		  {"title":"c","url":"https://c.example.com#frag"},
+		  {"title":"c2","url":"https://c.example.com"}]`, &res)
+	if code != http.StatusOK || res["imported"] != 2 || res["skipped"] != 3 {
+		t.Fatalf("import = %d %v, want 200 imported=2 skipped=3", code, res)
 	}
-	if got := listTitles(t, srv); !slices.Equal(got, []string{"a", "dup"}) {
+	if got := listTitles(t, srv); !slices.Equal(got, []string{"a", "b", "c"}) {
 		t.Fatalf("list = %v", got)
+	}
+	// Only the kept items got an icon fetch queued (the first call is
+	// the earlier postBookmark create).
+	if got := icons.calls(); len(got) != 3 ||
+		got[1].url != "https://b.example.com" ||
+		got[2].url != "https://c.example.com#frag" {
+		t.Fatalf("enqueued = %v, want create + b + c", got)
+	}
+}
+
+// TestImportReplaceKeepsDuplicates: replace mode reproduces the file
+// verbatim — in-file duplicates are imported, never skipped.
+func TestImportReplaceKeepsDuplicates(t *testing.T) {
+	srv, _, icons := newTestServer(t)
+	postBookmark(t, srv, "old", "https://old.example.com")
+
+	var res map[string]int
+	code := reqRaw(t, srv, http.MethodPost, "/api/import?mode=replace",
+		`[{"title":"x","url":"https://a.example.com"},
+		  {"title":"x2","url":"https://A.example.com/"}]`, &res)
+	if code != http.StatusOK || res["imported"] != 2 || res["skipped"] != 0 {
+		t.Fatalf("import = %d %v, want 200 imported=2 skipped=0", code, res)
+	}
+	if got := listTitles(t, srv); !slices.Equal(got, []string{"x", "x2"}) {
+		t.Fatalf("list = %v", got)
+	}
+	// The create above plus both imported items queued icon fetches.
+	if got := icons.calls(); len(got) != 3 {
+		t.Fatalf("enqueued = %v, want 3 calls", got)
+	}
+}
+
+// TestImportAppendIgnoresSettings: embedded settings are never applied
+// in append mode — even an invalid grid does not reject the import.
+func TestImportAppendIgnoresSettings(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	body := `{"settings":{"grid":{"rows":99,"cols":5}},"bookmarks":[{"url":"https://x.example.com"}]}`
+	var res map[string]int
+	if code := reqRaw(t, srv, http.MethodPost, "/api/import?mode=append", body, &res); code != http.StatusOK {
+		t.Fatalf("append import = %d, want 200", code)
+	}
+	if res["imported"] != 1 {
+		t.Fatalf("imported = %v", res)
+	}
+	var st store.Settings
+	reqJSON(t, srv, http.MethodGet, "/api/settings", nil, &st)
+	if st.Grid != store.DefaultGrid {
+		t.Fatalf("settings = %+v, want default grid", st)
 	}
 }
 

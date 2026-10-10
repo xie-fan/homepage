@@ -147,8 +147,9 @@ func (s *server) reorderBookmarks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, bs)
 }
 
-// refreshIcon marks the bookmark's icon pending, queues a refetch, and
-// answers 202 with the updated bookmark.
+// refreshIcon marks the bookmark's icon pending, queues a forced
+// refetch (an explicit refresh bypasses the icon cache), and answers
+// 202 with the updated bookmark.
 func (s *server) refreshIcon(w http.ResponseWriter, r *http.Request) {
 	id, aerr := pathID(r)
 	if aerr != nil {
@@ -165,7 +166,7 @@ func (s *server) refreshIcon(w http.ResponseWriter, r *http.Request) {
 		s.handleErr(w, r, err)
 		return
 	}
-	s.icons.Enqueue(b.ID, b.URL)
+	s.icons.EnqueueForce(b.ID, b.URL)
 	// Re-read so the response reflects the persisted icon state.
 	b, err = s.store.BookmarkStore.Get(ctx, id)
 	if err != nil {
