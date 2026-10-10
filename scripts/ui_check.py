@@ -102,6 +102,7 @@ def lay():
     for i,pg,pos in a: P.setdefault(pg,[]).append((pos,i))
     return [[i for _,i in sorted(P[k])] for k in sorted(P)]
 # drag thumbnails
+LB = lay()
 before = ev("fetch('/api/bookmarks').then(r=>r.json()).then(a=>a.map(b=>b.id))")
 a = ev("(()=>{const v=[...document.querySelectorAll('[data-id]')].filter(e=>{const r=e.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth});const r=v[0].getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2-6,+v[0].dataset.id]})()")
 mouse('mouseMoved',a[0],a[1],0); mouse('mousePressed',a[0],a[1])
@@ -117,7 +118,7 @@ if thumbs and len(thumbs)>=2:
     check('dwell on thumbnail switches page', pg==1 or pg==(ev(page)), f'page idx {pg}')
     mouse('mouseReleased',t2[1],t2[2],0); time.sleep(1.5)
     L = lay()
-    check('drop on thumbnail appends to end of that page', len(L)>1 and L[1][-1]==U(a[2]) and len(L[0])==23, [len(p) for p in L])
+    check('release on thumbnail cancels (layout unchanged)', L==LB, [len(p) for p in L])
     check('strip hidden after drop', not ev("[...document.querySelectorAll('[role=listbox] [aria-label^=\"第\"]')].some(e=>{const r=e.getBoundingClientRect();return r.width>0&&getComputedStyle(e.closest('[role=listbox]')||e).visibility!=='hidden'&&+getComputedStyle(e.closest('[role=listbox]')||e).opacity>0.05})"))
     # restore order
     restore_all()
@@ -219,7 +220,7 @@ if th and len(th)>=2:
     check('5d dwell on page-2 thumbnail switched page', ev(page)==1, ev(page))
     c = cell_xy(1); path(lerp((th[1][0],th[1][1]),c,8)); release(*c)
     L = lay()
-    check('8b cross-page: inserted at hovered slot, source page keeps gap (nothing pulled)', len(L)==2 and len(L[0])==23 and L[1]==[L0[1][0],U(a[2])]+L0[1][1:] and L[0]==[x for x in L0[0] if x!=U(a[2])], [len(p) for p in L])
+    check('8j/8b page1 -> dwell page-2 thumbnail -> page 2 slot 1: inserted at slot, source page keeps gap (nothing pulled)', len(L)==2 and len(L[0])==23 and L[1]==[L0[1][0],U(a[2])]+L0[1][1:] and L[0]==[x for x in L0[0] if x!=U(a[2])], [len(p) for p in L])
 reset()
 # 8c. cross-page into a FULL page: page1 first -> page0 slot 0 => page0's last pushed to front of page1
 cmd('Input.dispatchKeyEvent', type='rawKeyDown', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39); cmd('Input.dispatchKeyEvent', type='keyUp', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39); time.sleep(0.8)
@@ -233,27 +234,37 @@ if th and len(th)>=2:
     check('8c drop into full page: its last item cascades to front of next page', L[0]==[U(a[2])]+L0[0][:23] and L[1]==[L0[0][23]]+L0[1][1:], [len(p) for p in L])
     check('8c preview matched committed layout', U(prev[:24])==L[0], prev[:5])
 reset()
-# 8e. thumbnail drop of a page-2 tile onto FULL page 1: becomes page 1's LAST tile, old last pushed to front of page 2
+# 8e. page-2 tile hovered on page-1 thumbnail: preview shows original layout; release on thumbnail cancels
 cmd('Input.dispatchKeyEvent', type='rawKeyDown', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39); cmd('Input.dispatchKeyEvent', type='keyUp', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39); time.sleep(0.8)
 a = tile_xy(0); press(a[0],a[1]); th = thumbs_xy()
 if th:
-    A = U(a[2])
-    exp0 = L0[0][:23] + [A]; exp1 = [L0[0][23]] + [x for x in L0[1] if x != A]
-    path(lerp((a[0]+15,a[1]+15),(th[0][0],th[0][1]),3), 0.01); time.sleep(0.25)  # stay below the 400ms dwell: page 2 still shown
-    prev_pg = ev(page); prev2 = U(shown_ids()) if prev_pg == 1 else None
-    prev_mini = ev("[...document.querySelectorAll('[role=listbox] .thumb')].map(t=>t.querySelectorAll('[data-id],img,.mini,i,span').length)")
+    path(lerp((a[0]+15,a[1]+15),(th[0][0],th[0][1]),3), 0.01); time.sleep(0.25)   # before the dwell flip: page 2 still shown
+    pg_ = ev(page); prev = U(shown_ids())
     release(th[0][0],th[0][1])
-    L = lay()
-    check('8e thumbnail drop onto full page: dropped tile is LAST of target, old last cascades to front of next page', L[0]==exp0 and L[1]==exp1, (L[0][-2:], L[1][:2]))
-    check('8e preview (page 2 while hovering page-1 thumbnail) matches committed page 2', prev2 is None or prev2[:len(exp1)]==exp1, (prev_pg, prev2[:3] if prev2 else None))
+    check('8e hover page-1 thumbnail: preview = original layout (no pending move)', pg_==1 and prev[:len(L0[1])]==L0[1], (pg_, prev[:3]))
+    check('8e release on page-1 thumbnail cancels (layout unchanged)', lay()==L0, [len(p) for p in lay()])
 reset()
-# 8e2. thumbnail drop onto own full page (page 1 tile -> page-1 thumbnail): moves to end, nothing cascades
+# 8e2. page-1 tile: dwell on page-2 thumbnail (switch), release on the thumbnail -> cancel; preview original
 a = tile_xy(3); press(a[0],a[1]); th = thumbs_xy()
+if th and len(th)>=2:
+    path(lerp((a[0]+15,a[1]+15),(th[1][0],th[1][1]),3), 0.01); time.sleep(0.9)
+    pg_ = ev(page); prev = U(shown_ids())
+    release(th[1][0],th[1][1])
+    check('8e2 after switch, still on thumbnail: preview = original page 2', pg_==1 and prev[:len(L0[1])]==L0[1], (pg_, prev[:4]))
+    check('8e2 release on thumbnail after switch cancels (layout unchanged)', lay()==L0, [len(p) for p in lay()])
+reset()
+# 8i. page 2 -> dwell on page-1 thumbnail -> continue into FULL page 1 slot 5 -> insert there, page-1 last cascades to front of page 2
+cmd('Input.dispatchKeyEvent', type='rawKeyDown', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39); cmd('Input.dispatchKeyEvent', type='keyUp', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39); time.sleep(0.8)
+a = tile_xy(1); press(a[0],a[1]); th = thumbs_xy()
 if th:
     A = U(a[2])
-    path(lerp((a[0]+15,a[1]+15),(th[0][0],th[0][1]),3), 0.01); release(th[0][0],th[0][1])
-    L = lay()
-    check('8e2 thumbnail drop onto own full page: move to end, no cascade', L[0]==[x for x in L0[0] if x!=A]+[A] and L[1]==L0[1], (L[0][-2:], L[1][:1]))
+    path(lerp((a[0]+15,a[1]+15),(th[0][0],th[0][1]),3), 0.01); time.sleep(0.9)
+    check('8i dwell on page-1 thumbnail switched to page 1', ev(page)==0, ev(page))
+    c = cell_xy(5); path(lerp((th[0][0],th[0][1]),c,10)); time.sleep(0.4)
+    prev = U(shown_ids()); release(*c)
+    L = lay(); exp0 = L0[0][:5]+[A]+L0[0][5:23]; exp1 = [L0[0][23]]+[x for x in L0[1] if x!=A]
+    check('8i page2 -> full page 1 slot 5: inserted at slot, old last to front of page 2', L[0]==exp0 and L[1]==exp1, (L[0][4:7], L[1][:2]))
+    check('8i preview matched committed page 1', prev[:24]==exp0, prev[4:7])
 reset()
 # 8f. '+' add from page 0 when page 0 is full -> end of page 1; from last full pages -> new page
 r = ev("fetch('/api/bookmarks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:'T1',url:'https://t1.example.org/',page:0})}).then(r=>r.json())")

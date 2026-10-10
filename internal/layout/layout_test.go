@@ -70,35 +70,37 @@ func TestInsert(t *testing.T) {
 		{"cascade across multiple full pages",
 			[][]int64{{1, 2}, {3, 4}, {5, 6}}, 1, 1, 0, 2,
 			[][]int64{{2}, {1, 3}, {4, 5}, {6}}},
-		// A thumbnail drop sends a huge index: "append" to a FULL page
-		// lands at cap-1 — the dropped id takes the last slot and the
-		// page's previous tail cascades to the next page's front.
-		{"thumbnail drop from the next page onto a full one",
+		// An index past the end of a FULL page lands at cap-1 — the
+		// dropped id takes the last slot and the page's previous tail
+		// cascades to the next page's front. The cases below use a huge
+		// index (1<<30) to stand for any index past the end — e.g. a
+		// drop on the empty area past a full page's slots.
+		{"index past the end of a full page from the next page",
 			[][]int64{{1, 2, 3}, {4, 5}}, 4, 0, 1 << 30, 3,
 			[][]int64{{1, 2, 4}, {3, 5}}},
-		{"thumbnail drop from a later page cascades across full pages",
+		{"index past the end from a later page cascades across full pages",
 			[][]int64{{1, 2, 3}, {4, 5, 6}, {7, 8}}, 7, 0, 1 << 30, 3,
 			[][]int64{{1, 2, 7}, {3, 4, 5}, {6, 8}}},
-		{"thumbnail drop from an earlier page onto a full one",
+		{"index past the end of a full page from an earlier page",
 			[][]int64{{1, 2, 3}, {4, 5, 6}, {7, 8}}, 1, 1, 1 << 30, 3,
 			[][]int64{{2, 3}, {4, 5, 1}, {6, 7, 8}}},
-		{"thumbnail drop onto a full last page spills onto a new one",
+		{"index past the end of a full last page spills onto a new one",
 			[][]int64{{1, 2, 3}, {4, 5, 6}}, 1, 1, 1 << 30, 3,
 			[][]int64{{2, 3}, {4, 5, 1}, {6}}},
-		{"thumbnail drop on the id's own full page moves it to the tail",
+		{"index past the end of the id's own full page moves it to the tail",
 			[][]int64{{1, 2, 3}, {4}}, 1, 0, 1 << 30, 3,
 			[][]int64{{2, 3, 1}, {4}}},
-		{"thumbnail drop on own page when already last is a no-op",
+		{"index past the end of own page when already last is a no-op",
 			[][]int64{{1, 2, 3}, {4}}, 3, 0, 1 << 30, 3,
 			[][]int64{{1, 2, 3}, {4}}},
-		{"thumbnail drop cascades over several full pages",
+		{"index past the end cascades over several full pages",
 			[][]int64{{1, 2}, {3, 4}, {5, 6}, {7, 8}}, 7, 0, 1 << 30, 2,
 			[][]int64{{1, 7}, {2, 3}, {4, 5}, {6, 8}}},
 		// The same clamp on a page with room is a plain append at its end.
-		{"thumbnail drop on a page with room appends at its end",
+		{"index past the end of a page with room appends at its end",
 			[][]int64{{1, 2}, {3, 4}}, 1, 1, 1 << 30, 3,
 			[][]int64{{2}, {3, 4, 1}}},
-		{"thumbnail drop from an emptied page keeps target numbering",
+		{"index past the end from an emptied page keeps target numbering",
 			[][]int64{{1}, {2, 3, 4}}, 1, 1, 1 << 30, 3,
 			[][]int64{{2, 3, 1}, {4}}},
 		{"insert into page len creates a page",

@@ -22,22 +22,24 @@
 //   • over an empty slot on page p → index len(L0[p] without the dragged
 //     id); unified with the tile rule as index = min(cell, that length)
 //   • the dashed "+ 新页" page      → a new last page: page = len(L0)
-//   • a page thumbnail             → index 1e9 (insert() and the server
-//     clamp it to min(len, cap-1): the item takes the page's LAST slot
-//     and a full page's previous tail cascades to the next page)
-//   • anywhere outside the current page's padded grid and the thumbnails
-//     → preview = L0, so what you see is what a cancel restores
+//   • a page thumbnail             → NOT a target: thumbs only switch
+//     the viewed page after a ~400ms dwell so the drag can continue
+//     into that page's grid; a release on one cancels the drag
+//   • anywhere outside the current page's padded grid — thumbnails
+//     included → preview = L0, so what you see is what a cancel
+//     restores, and a release there cancels like Esc
 //
 // A DISPLAYED page index can differ from its L0 index in exactly one
 // case: the dragged item was the only bookmark on its L0 page and the
 // preview moved it off — the emptied page no longer exists and later
 // displayed pages sit one lower. mapPage() translates displayed → L0.
 //
-// A drop POSTs /api/bookmarks/move {id,page,index} with the same values
-// the current preview used and adopts the returned list — the server is
-// the source of truth. While a drag runs, thumbs.js mounts a strip of
-// page thumbnails above the pager; edge-dwell page flips and thumbnail
-// dwell switching work like before.
+// A drop on the grid POSTs /api/bookmarks/move {id,page,index} with the
+// same values the current preview used and adopts the returned list —
+// the server is the source of truth. A release anywhere else — a page
+// thumbnail included — cancels: no POST, nothing changes. While a drag
+// runs, thumbs.js mounts a strip of page thumbnails above the pager;
+// edge-dwell page flips and thumbnail dwell switching work like before.
 //
 // Imports are one-way — app.js never imports this file; it calls the
 // handlers registered at the bottom. index.html loads both modules.
@@ -51,7 +53,6 @@ import * as thumbs from './thumbs.js';
 
 const EDGE_DWELL_MS = 700; // dwell time per edge flip (repeats while held)
 const CLONE_SCALE = 1.05; // slight zoom on the floating clone
-const DROP_END = 1e9;     // index meaning "the end of the page" (clamped)
 
 // Edge zone width: the wider of 56px and 8% of the viewport element's
 // width, so the flip target stays reachable on wide screens.
@@ -150,17 +151,20 @@ function move(x, y) {
   dnd.x = x;
   dnd.y = y;
   positionClone(x, y);
-  // A page thumbnail under the pointer owns it: the preview shows the
-  // item in that page's last slot (index 1e9 — the very value a drop
-  // sends; insert() clamps it to cap-1 on a full page so the tail
-  // cascades, just like the server) and the edge zones are disarmed
-  // until the pointer moves off.
+  // A point that is actually ON a thumbnail belongs to the strip:
+  // thumbs.move() tracks the hover and arms the page-flip dwell, the
+  // edge zones stay disarmed, and the preview reverts to L0 — thumbs
+  // are switch-only, never drop targets, so what the grid shows is
+  // exactly what a release there (a cancel) restores. Points anywhere
+  // else — on the strip card but between thumbs included — fall through
+  // to the grid, so cells the fixed strip overlaps on short viewports
+  // stay reachable. state.page is read live inside updateTarget, so the
+  // first move after a thumbnail/edge flip already hit-tests the NEW
+  // page (gridMetrics uses its settled box, not the animating rect).
   const tp = thumbs.move(x, y);
   if (tp !== null) {
     setEdge(0);
-    const p = mapPage(tp);
-    setPreview(insert(dnd.L0, dnd.id, p, DROP_END, pageSize()),
-      { page: p, index: DROP_END });
+    setPreview(dnd.L0, null);
     return;
   }
   updateEdge(x, y);
@@ -174,26 +178,19 @@ async function drop() {
   const up = lastUp && performance.now() - lastUp.t < 250 ? lastUp : dnd;
   const x = up.x;
   const y = up.y;
-  // A release on a page thumbnail moves the item to that page's LAST
-  // slot — on a full page its tail cascades to the next page's front
-  // (the strip is still mounted here — cleanup() hides it below).
   // A release over the current page's grid commits the same {page,index}
   // the live preview just used, so what the placeholder showed is what
-  // persists. A release anywhere else cancels the drag like Esc.
-  let target = null;
-  const tp = thumbs.dropPage(x, y);
-  if (tp !== null) {
-    const p = mapPage(tp);
-    target = { page: p, index: DROP_END };
-    setPreview(insert(dnd.L0, dnd.id, p, DROP_END, pageSize()), target);
-    goToPage(tp); // land the view where the drop went (clamps itself)
-  } else if (overGrid(x, y)) {
-    updateTarget(x, y); // recompute at the real release point
-    target = dnd.target;
-  } else {
+  // persists. A release anywhere else cancels the drag like Esc — a page
+  // thumbnail included: thumbs only ever switch the viewed page mid-drag
+  // (the strip is still mounted here — cleanup() hides it below — and on
+  // short viewports a thumb may overlap grid cells, so it is checked
+  // first).
+  if (thumbs.dropPage(x, y) !== null || !overGrid(x, y)) {
     cancel(); // outside every valid target: revert, re-render, no save
     return;
   }
+  updateTarget(x, y); // recompute at the real release point
+  const target = dnd.target;
   const unchanged = target === null || sameLayout(dnd.preview, dnd.L0);
   const id = dnd.id;
   cleanup();

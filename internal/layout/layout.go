@@ -28,14 +28,15 @@ func FromFlat(ids []int64, cap int) [][]int64 {
 // Insert moves id to slot index of page — page == len(L) means a new
 // last page — then lets the target page's overflow cascade forward and
 // drops empty pages. The index clamps to min(len(page), cap-1): an
-// "append" to a full page lands at cap-1, so the dropped tile takes the
-// page's LAST slot and its previous tail is pushed to the front of the
-// next page; on a page with room len(page) ≤ cap-1 already, so it still
-// appends at the end. Removing id closes up its page (nothing is pulled
-// from the next page), but the emptied page keeps its number until
-// DropEmpty runs at the end, so the target page/index still refer to
-// the input's numbering. A thumbnail drop is Insert with a huge index
-// (e.g. 1e9) that clamps into the page's last slot.
+// index past the end of a FULL page lands at cap-1 — not len(page) —
+// so the dropped tile takes the page's LAST slot and its previous tail
+// is pushed to the front of the next page (clamping to len(page) would
+// append after the last slot and cascade the dropped tile itself off
+// the page it was dropped on); on a page with room len(page) ≤ cap-1
+// already, so it still appends at the end. Removing id closes up its
+// page (nothing is pulled from the next page), but the emptied page
+// keeps its number until DropEmpty runs at the end, so the target
+// page/index still refer to the input's numbering.
 func Insert(L [][]int64, id int64, page, index, cap int) [][]int64 {
 	cap = normCap(cap)
 	L = removeID(clone(L), id)

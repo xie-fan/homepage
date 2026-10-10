@@ -159,8 +159,8 @@ Layout = `[][]int64` (ids per page, in order). All ops return a new layout.
   the dropped tile becomes the page's last tile and the previous last tile is pushed to the
   front of the next page, cascading as usual (clamping to len(page) instead would eject the
   dropped tile itself). On a page with room `len(page) <= cap-1` already, so a plain append at
-  its end still results. Thumbnail drop = Insert with a huge index (1e9, clamped); any index
-  past the end — hovering an empty slot, index beyond length — takes the same path.
+  its end still results. Any index past the end — hovering past a full page's slots or its
+  empty area, or a client sending an out-of-range index — takes the same path.
 - `cascade(L, from, cap)` — for p = from…: while len(L[p]) > cap, pop its last item and push it to
   the FRONT of L[p+1] (creating a new last page if needed).
 - `Add(L, id, fromPage, cap)` — first page p ≥ fromPage with a free slot gets `id` at its end;
@@ -187,11 +187,19 @@ Layout = `[][]int64` (ids per page, in order). All ops return a new layout.
 ### Frontend
 - Pages are derived by grouping `state.bookmarks` by `page`; page count = max(page)+1 (≥1).
 - Drag preview = `layout.insert(originalLayout, id, hoverPage, hoverIndex, cap)` recomputed from the
-  drag-start snapshot on every hover change (never cumulative); pointer outside grid/thumbnails →
-  preview shows the original layout (matches cancel on release). Drop → `POST /api/bookmarks/move`,
-  adopt the returned list (server is the source of truth). Hovering an empty slot → index =
-  len(page without the dragged id) — always ≤ cap-1, so it lands inside the page; a thumbnail →
-  index 1e9 → the page's last slot (cap-1 on a full page, tail cascades).
+  drag-start snapshot on every hover change (never cumulative); pointer anywhere outside the grid —
+  page thumbnails included → preview shows the original layout (matches cancel on release). Drop on
+  the grid → `POST /api/bookmarks/move`, adopt the returned list (server is the source of truth).
+  Release on a thumbnail or anywhere else outside the grid cancels the drag: nothing is sent.
+  Hovering an empty slot → index = len(page without the dragged id) — always ≤ cap-1, so it lands
+  inside the page.
+- Page thumbnails are switch-only during a drag: parking the pointer ~400ms on one flips the main
+  view to that page, then the drag continues into that page's grid and releases there do a normal
+  insert-at-hovered-slot move. Thumbs are never drop targets — a release on one cancels the drag.
+  A point only counts as "on a thumbnail" when it hits an actual `.thumb` element (strip padding /
+  gaps between thumbs fall through to the grid), so cells the fixed strip overlaps on short
+  viewports stay reachable; hit-testing uses the current page's settled viewport box, so the first
+  move after a page flip already targets the new page.
 - Add sends `page: currentPage`; afterwards go to the new bookmark's page and highlight it.
 - Search view unchanged (flat filtered list, drag disabled).
 
@@ -199,5 +207,6 @@ Layout = `[][]int64` (ids per page, in order). All ops return a new layout.
 - P1 (backend): internal/layout + tests; migration 0003; store (page/position, Move/Add/Remove/Reflow
   in tx, import/export); API (move endpoint, add page hint, settings reflow, remove /order); tests.
 - P2 (frontend, parallel, against the contract above): web/static/layout.js; app.js page grouping,
-  add-with-page; dnd.js snapshot preview + move endpoint + outside-grid revert; thumbs.js drop → move.
+  add-with-page; dnd.js snapshot preview + move endpoint + outside-grid/thumbnail revert;
+  thumbs.js dwell → page switch (release on a thumb cancels).
 - P3 (reviewer): ui_check.py scenarios, migration check against pre-pages backup, container rebuild.

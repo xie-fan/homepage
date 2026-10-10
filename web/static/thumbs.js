@@ -14,18 +14,22 @@
 // plus — under the same condition dnd.js wantsExtraPage() appends its
 // dashed drop page (the preview hasn't grown past the committed layout)
 // — a final "+ 新页" thumbnail. With independent pages a new page is
-// always a meaningful drop target: it creates a fresh last page rather
-// than landing on an existing one.
+// always a meaningful destination: dwelling on the thumb flips the view
+// to the grid's dashed drop page, where a release creates a fresh last
+// page rather than landing on an existing one.
 //
 // Behaviour: parking the pointer ~400ms on a thumbnail flips the main
-// view to that page (one shot per entry) so the tile can be dropped at a
-// precise slot; while a thumb is under the pointer dnd.js disarms the
-// edge-flip zones and previews the item in that page's last slot. A release
-// over a thumbnail is resolved by dnd.js through dropPage(): the item
-// moves to that page's LAST slot (index 1e9 → clamped to cap-1 on a
-// full page, so its previous tail cascades forward), and
-// a release on "+ 新页" targets page = number of pages. Thumbs report
-// DISPLAYED page indices; dnd.js translates them into layout indices.
+// view to that page (one shot per entry) so the drag can continue into
+// that page's grid and drop at a precise slot. Page switching is ALL a
+// thumbnail does — it is never a drop target: while a thumb is under
+// the pointer dnd.js disarms the edge-flip zones and shows the
+// committed layout (the same thing a cancel restores), and a release
+// over a thumbnail — resolved by dnd.js through dropPage() — CANCELS
+// the drag exactly like a release outside the grid: nothing moves and
+// nothing is sent to the server. The "+ 新页" thumb works the same way:
+// dwell flips to the new-page view, release on it cancels. Thumbs
+// report DISPLAYED page indices; dnd.js translates them into layout
+// indices.
 // hide() fades the strip out and clears every timer and the resize hook
 // — the strip itself is hit-tested geometrically through
 // document.elementsFromPoint and has no DOM listeners of its own, so
@@ -257,8 +261,8 @@ function setHover(p) {
 }
 
 // move is called on every drag pointermove; it returns the hovered page
-// index (or null) so dnd.js can suppress grid reorder and edge flips
-// while a thumbnail owns the pointer.
+// index (or null) so dnd.js can keep the cancel preview and disarm edge
+// flips while a thumbnail owns the pointer.
 export function move(x, y) {
   const p = thumbAt(x, y);
   setHover(p);
@@ -266,7 +270,8 @@ export function move(x, y) {
 }
 
 // dropPage resolves a release point to a thumbnail page index (or null)
-// without touching hover state — used by dnd.js on pointerup.
+// without touching hover state — used by dnd.js on pointerup, where any
+// non-null answer cancels the drag (a release on a thumb never commits).
 export function dropPage(x, y) {
   return thumbAt(x, y);
 }
