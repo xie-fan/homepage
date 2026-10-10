@@ -283,6 +283,20 @@ body {
   }
 }
 
+/* Freshly added tile: app.js tags it .tile-new for ~1.5s so the pulse
+   draws the eye to where the bookmark landed. */
+.tile-new .tile-link {
+  outline: 3px solid transparent;
+  outline-offset: 2px;
+  animation: tile-new-pulse 0.75s ease-in-out 2;
+}
+
+@keyframes tile-new-pulse {
+  50% {
+    outline-color: var(--accent);
+  }
+}
+
 /* ---------- drag & drop ---------- */
 
 /* The dragged item's slot collapses to a dashed placeholder; it moves
@@ -564,5 +578,11 @@ body.dnd-edge-right .viewport::after {
 @media (prefers-reduced-motion: reduce) {
   .track {
     transition: none;
+  }
+  /* No pulse: a static accent ring marks the new tile for the same
+     ~1.5s window (app.js removes .tile-new on a timer). */
+  .tile-new .tile-link {
+    animation: none;
+    outline-color: var(--accent);
   }
 }

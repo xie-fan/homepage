@@ -14,8 +14,6 @@ const state = {
   loadError: null,
 };
 
-const PAGE_KEY = 'homepage.page'; // sessionStorage key for the current page
-
 // Wheel: accumulate deltas so both wheel mice and trackpads work; a
 // threshold + cooldown makes one gesture flip exactly one page.
 const WHEEL_THRESHOLD = 40; // accumulated delta units to trigger a flip
@@ -146,7 +144,6 @@ function layout() {
 
 function render() {
   clampPage();
-  sessionStorage.setItem(PAGE_KEY, String(state.page));
   layout();
   renderTrack();
   renderDots();
@@ -294,7 +291,6 @@ function updateArrows() {
 
 function goToPage(i) {
   state.page = Math.min(Math.max(i, 0), displayPageCount() - 1);
-  sessionStorage.setItem(PAGE_KEY, String(state.page));
   offsetTrack(0, true);
   renderDots();
   updateArrows();
@@ -305,11 +301,6 @@ function offsetTrack(dx, animate) {
   const w = els.viewport.clientWidth || 1;
   els.track.classList.toggle('no-anim', !animate);
   els.track.style.transform = `translateX(${-state.page * w + dx}px)`;
-}
-
-function restorePage() {
-  const saved = Number.parseInt(sessionStorage.getItem(PAGE_KEY) ?? '', 10);
-  if (Number.isFinite(saved)) state.page = saved; // render() clamps it
 }
 
 // ---------- wheel & keys ----------
@@ -336,6 +327,24 @@ function onWheel(e) {
 const isEditable = (t) =>
   t instanceof HTMLElement &&
   (t.isContentEditable || /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName));
+
+// Resize storms (window drags, mobile URL-bar churn) are coalesced to one
+// layout pass per frame.
+let resizeRaf = 0;
+function onResize() {
+  if (resizeRaf) return;
+  resizeRaf = requestAnimationFrame(() => {
+    resizeRaf = 0;
+    layout(); // tiles/gutters track the new viewport box
+    // Re-snap right away: the page width changed with the viewport, so
+    // re-apply the transform for the current page with the transition
+    // OFF and force a reflow — the grid recenters without animating —
+    // then restore the transition for later page moves.
+    offsetTrack(0, false);
+    void els.track.offsetWidth; // commit the snap before re-enabling
+    els.track.classList.remove('no-anim');
+  });
+}
 
 function onKeyDown(e) {
   if (e.key === 'Escape') {
@@ -364,8 +373,28 @@ function onKeyDown(e) {
 // a tile not yet qualified as a drag, 'tile' = running tile drag (dnd.js),
 // active = running page swipe.
 let drag = null;
-let suppressClick = false; // swallow the click that follows a swipe or drag
 let pressTimer = 0; // touch/pen hold timer on a tile
+
+// Post-gesture click suppression. A swipe or tile drag is followed by the
+// gesture's own release click, which must not activate whatever lies under
+// the pointer. This used to be a plain flag that only the next click
+// cleared — so when the browser never delivered that release click
+// (pointer released off-window, capture retargeting, a second finger), it
+// went stale and ate an unrelated later click: the first ⚙ press after a
+// drag could silently do nothing. Now a click is eaten only when it lands
+// inside the viewport within SUPPRESS_CLICK_MS of the gesture's pointerup
+// — i.e. only the release click of that same gesture; header buttons and
+// modal dialogs can never be swallowed.
+const SUPPRESS_CLICK_MS = 350;
+let suppressClickUntil = 0; // performance.now() deadline; 0 = disarmed
+// Pointer id of a tile drag cancelled while still held (Esc): its eventual
+// release click still belongs to that gesture, so its pointerup arms
+// suppression too (see onPointerEnd).
+let suppressReleaseId = -1;
+
+function armClickSuppress() {
+  suppressClickUntil = performance.now() + SUPPRESS_CLICK_MS;
+}
 
 function onPointerDown(e) {
   // A second finger arriving mid-gesture is ignored. Pending/inactive
@@ -374,7 +403,10 @@ function onPointerDown(e) {
   if (drag && (drag.active || drag.mode === 'tile')) return;
   if (e.pointerType === 'mouse' && e.button !== 0) return;
   cancelPress();
-  suppressClick = false; // a new gesture clears any stale suppression
+  // A new press retires whatever the last gesture left armed: the click
+  // that follows belongs to THIS gesture, never to the old one.
+  suppressClickUntil = 0;
+  suppressReleaseId = -1;
   if (modalOpen()) return;
   const tileEl = e.target.closest('.tile');
   drag = {
@@ -382,7 +414,7 @@ function onPointerDown(e) {
     startX: e.clientX, startY: e.clientY,
     lastX: e.clientX, lastY: e.clientY,
     startT: performance.now(),
-    dx: 0, active: false, mode: null, tileId: 0,
+    dx: 0, active: false, mode: null, tileId: 0, eatClick: false,
   };
   // Swipe vs tile-drag rule: a press landing on a real tile (not on its ✎
   // button, not the dashed drop slot) is a tile-drag CANDIDATE — it becomes
@@ -410,7 +442,6 @@ function startTileDrag() {
   }
   cancelPress();
   drag.mode = 'tile';
-  suppressClick = true; // the release click must not open the link
   try {
     els.viewport.setPointerCapture(drag.pointerId);
   } catch {
@@ -424,12 +455,15 @@ function startTileDrag() {
 function cancelTileDrag() {
   cancelPress();
   if (drag) {
-    try {
-      els.viewport.releasePointerCapture(drag.pointerId);
-    } catch { /* pointer was never captured */ }
+    const pointerId = drag.pointerId;
+    // The pointer is still held: remember it so the release click it
+    // eventually produces is eaten as this gesture's own (onPointerEnd).
+    // drag is nulled BEFORE releasing capture because lostpointercapture
+    // may fire synchronously and must not see a live gesture.
+    suppressReleaseId = pointerId;
     drag = null;
+    releaseCapture(pointerId);
   }
-  suppressClick = true; // eat the click when the held pointer releases
   tileDnd.cancel();
 }
 
@@ -459,7 +493,7 @@ function onPointerMove(e) {
       if (dist > HOLD_SLOP) {
         cancelPress();
         drag.mode = null;
-        suppressClick = true; // moved too far to count as a tap
+        drag.eatClick = true; // moved too far to count as a tap
       }
     }
     if (Math.abs(dx) < SWIPE_SLOP) return;
@@ -474,19 +508,29 @@ function onPointerMove(e) {
 
 function onPointerEnd(e) {
   cancelPress();
+  if (e.pointerId === suppressReleaseId) {
+    suppressReleaseId = -1;
+    // The held pointer of an Esc-cancelled drag just released: the click
+    // it produces is still that gesture's — arm suppression now.
+    armClickSuppress();
+  }
   if (!drag || e.pointerId !== drag.pointerId) return;
-  const { dx, startT, active, mode } = drag;
+  const { dx, startT, active, mode, eatClick } = drag;
   drag = null;
+  releaseCapture(e.pointerId);
   if (mode === 'tile') {
-    suppressClick = true; // a drag is never a link click
+    armClickSuppress(); // a drag is never a link click
     if (tileDnd) {
       if (e.type === 'pointercancel') tileDnd.cancel();
       else tileDnd.drop();
     }
     return;
   }
-  if (!active) return;
-  suppressClick = true;
+  if (!active) {
+    if (eatClick) armClickSuppress();
+    return;
+  }
+  armClickSuppress();
   const w = els.viewport.clientWidth || 1;
   const velocity = Math.abs(dx) / Math.max(performance.now() - startT, 1);
   let next = state.page;
@@ -496,9 +540,48 @@ function onPointerEnd(e) {
   goToPage(next); // snaps to next/prev or animates back to the current page
 }
 
+// releaseCapture frees the viewport's pointer capture if it still holds
+// one — capture must never outlive the gesture that set it.
+function releaseCapture(pointerId) {
+  try {
+    if (els.viewport.hasPointerCapture(pointerId)) {
+      els.viewport.releasePointerCapture(pointerId);
+    }
+  } catch {
+    // The pointer is already gone (lost-up race); nothing to release.
+  }
+}
+
+function onLostPointerCapture(e) {
+  // The implicit release right after every pointerup also arrives here —
+  // drag is already null then, so this is a no-op in the normal flow. It
+  // only bites when the browser takes the capture back mid-gesture.
+  if (drag && e.pointerId === drag.pointerId) abortGesture();
+}
+
+// abortGesture tears down a gesture that can no longer complete: the
+// capture was lost without a pointerup, or the window blurred mid-press.
+// The half-dragged track snaps back to the current page (never a flip
+// without a real release), and a release click — if one still arrives —
+// is eaten like any drag end.
+function abortGesture() {
+  cancelPress();
+  if (!drag) return;
+  const { pointerId, mode, active, eatClick } = drag;
+  drag = null;
+  releaseCapture(pointerId);
+  if (mode === 'tile' && tileDnd) tileDnd.cancel();
+  else if (active) goToPage(state.page); // re-center the dragged track
+  if (mode === 'tile' || active || eatClick) armClickSuppress();
+}
+
 function onClickCapture(e) {
-  if (!suppressClick) return;
-  suppressClick = false;
+  if (performance.now() > suppressClickUntil) return; // disarmed or expired
+  suppressClickUntil = 0;
+  // Only the gesture's own release click is eaten: it lands inside the
+  // viewport (pointer capture retargets it there) right after pointerup.
+  // Clicks on header buttons, modal dialogs or the pager pass through.
+  if (!els.viewport.contains(e.target)) return;
   e.preventDefault();
   e.stopPropagation();
 }
@@ -575,15 +658,17 @@ async function onBookmarkSubmit(e) {
     return;
   }
   if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url)) url = `https://${url}`;
+  let created = null;
   try {
     if (state.editing) {
       await api.updateBookmark(state.editing.id, title, url, allowDuplicate);
     } else {
-      await api.createBookmark(title, url, allowDuplicate);
+      created = await api.createBookmark(title, url, allowDuplicate);
     }
     closeModal();
     await refresh();
     pollIcons();
+    if (created) revealNewTile(created.id);
   } catch (err) {
     if (err.code === 'duplicate_url') {
       // Offer the explicit override: relabel the primary button and let
@@ -599,6 +684,22 @@ async function onBookmarkSubmit(e) {
     }
     showMsg(els.bmError, friendlyError(err), true);
   }
+}
+
+// revealNewTile flips to the page a just-added bookmark landed on (the
+// server appends it at the tail of the list) and pulses the tile briefly
+// so the eye finds it. The .tile-new ring is CSS (~1.5s); under
+// prefers-reduced-motion it shows as a static outline instead.
+function revealNewTile(id) {
+  const index = state.bookmarks.findIndex((b) => b.id === id);
+  if (index < 0) return;
+  goToPage(Math.floor(index / pageSize()));
+  const tile = els.track.querySelector(`.tile[data-id="${id}"]`);
+  if (!tile) return;
+  tile.classList.add('tile-new');
+  // Timed removal, not animationend: with animation:none the event never
+  // fires and the class would stay stuck on.
+  setTimeout(() => tile.classList.remove('tile-new'), 1600);
 }
 
 async function onDeleteClick() {
@@ -655,6 +756,35 @@ function onExportClick() {
   a.click();
 }
 
+// importDocError validates the import file BEFORE the replace confirm and
+// before any request is sent. Accepted shapes: the export object
+// ({"bookmarks": [...], "settings"?: {...}}) or a bare array. Every item
+// needs a non-empty string url; an optional settings.grid must hold
+// integer rows 3–5 and cols 4–6. Returns a short reason, or null.
+function importDocError(doc) {
+  let items = doc;
+  if (!Array.isArray(items)) {
+    if (!doc || typeof doc !== 'object') return '不是书签导出文件';
+    if (!Array.isArray(doc.bookmarks)) return '缺少 bookmarks 数组';
+    const grid = doc.settings ? doc.settings.grid : undefined;
+    if (grid !== undefined && grid !== null) {
+      if (typeof grid !== 'object' ||
+          !Number.isInteger(grid.rows) || grid.rows < 3 || grid.rows > 5 ||
+          !Number.isInteger(grid.cols) || grid.cols < 4 || grid.cols > 6) {
+        return 'settings.grid 无效（行须为 3–5，列须为 4–6）';
+      }
+    }
+    items = doc.bookmarks;
+  }
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (!it || typeof it !== 'object' || typeof it.url !== 'string' || !it.url.trim()) {
+      return `第 ${i + 1} 个书签缺少有效网址`;
+    }
+  }
+  return null;
+}
+
 async function onImportClick() {
   const file = els.importFile.files[0];
   if (!file) {
@@ -662,18 +792,30 @@ async function onImportClick() {
     return;
   }
   const mode = $('input[name="import-mode"]:checked')?.value || 'append';
-  if (mode === 'replace' && !confirm('替换模式将删除所有现有书签，确定继续？')) return;
   let doc;
   try {
     doc = JSON.parse(await file.text());
   } catch {
-    showMsg(els.setMsg, '文件不是有效的 JSON', true);
+    showMsg(els.setMsg, '导入文件格式不正确：不是有效的 JSON', true);
     return;
   }
+  const invalid = importDocError(doc);
+  if (invalid) {
+    // Rejected before the replace confirm and before any request.
+    showMsg(els.setMsg, `导入文件格式不正确：${invalid}`, true);
+    return;
+  }
+  if (mode === 'replace' && !confirm('替换模式将删除所有现有书签，确定继续？')) return;
   try {
     const res = await api.importBookmarks(doc, mode);
-    showMsg(els.setMsg, `成功导入 ${res.imported} 个书签`, false);
-    await refresh();
+    hideMsg(els.setMsg);
+    showToast(mode === 'replace'
+      ? `已替换为 ${res.imported} 个书签`
+      : `已导入 ${res.imported} 个，跳过 ${res.skipped ?? 0} 个重复`);
+    await refresh(); // reloads settings too: replace may import a new grid
+    // Reflect a freshly applied grid in the still-open dialog.
+    els.setRows.value = String(state.grid.rows);
+    els.setCols.value = String(state.grid.cols);
     pollIcons();
   } catch (err) {
     showMsg(els.setMsg, friendlyError(err), true);
@@ -751,17 +893,19 @@ function bindEvents() {
   els.btnSettings.addEventListener('click', openSettingsModal);
 
   document.addEventListener('keydown', onKeyDown);
-  window.addEventListener('resize', () => {
-    layout();          // tiles/gutters track the new viewport box
-    offsetTrack(0, false); // re-snap: page width = viewport width changed
-  });
+  window.addEventListener('resize', onResize);
   els.viewport.addEventListener('wheel', onWheel, { passive: false });
   els.viewport.addEventListener('pointerdown', onPointerDown);
   els.viewport.addEventListener('pointermove', onPointerMove);
   els.viewport.addEventListener('pointerup', onPointerEnd);
   els.viewport.addEventListener('pointercancel', onPointerEnd);
-  // Clicks are captured at document level: a drop can end over the arrows
-  // or dots, which live outside the viewport element.
+  // Gestures that lose their capture (or the window's focus) mid-press
+  // never see a pointerup — these keep drag state and pointer capture
+  // from outliving the gesture.
+  els.viewport.addEventListener('lostpointercapture', onLostPointerCapture);
+  window.addEventListener('blur', abortGesture);
+  // Release clicks are retargeted to the viewport while it holds pointer
+  // capture; document-level capture catches them wherever they dispatch.
   document.addEventListener('click', onClickCapture, true);
 
   els.formBookmark.addEventListener('submit', onBookmarkSubmit);
@@ -798,7 +942,6 @@ async function init() {
     els[id.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = document.getElementById(id);
   }
   bindEvents();
-  restorePage();
   try {
     await refresh();
     // Icons can already be pending at load (fresh import, previous
