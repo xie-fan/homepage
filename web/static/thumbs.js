@@ -23,10 +23,17 @@
 // is resolved by dnd.js through dropPage(): the item moves to the END of
 // that page. hide() fades the strip out and clears every timer and the
 // resize hook — the strip itself is hit-tested geometrically through
-// document.elementFromPoint (the drag clone is pointer-events:none, so
-// hit-testing sees through it) and has no DOM listeners of its own, so
+// document.elementsFromPoint and has no DOM listeners of its own, so
 // nothing else needs unbinding. Imports stay one-way:
 // dnd.js → thumbs.js → app.js.
+//
+// Hit-testability is instant: show() mounts the strip and turns its
+// pointer-events on in the same synchronous pass (.live), so the very
+// first drag move can already resolve a thumbnail — only the opacity
+// fade animates (.show, next frame). The drag clone never shadows the
+// strip: it is pointer-events:none and sits BELOW it in z-order
+// (thumbs.css), and thumbAt() skips any stack entry that isn't a thumb
+// even if that ever regresses.
 
 import { state, pageSize, goToPage } from './app.js';
 
@@ -77,6 +84,9 @@ export function show(id) {
   clearTimeout(removeTimer); // re-show during a fade-out keeps the element
   if (!strip) strip = makeStrip();
   if (!strip.isConnected) document.body.append(strip);
+  // Hit-testable from this same frame: .live turns pointer-events on now
+  // while .show (next frame) only animates the opacity fade.
+  strip.classList.add('live');
   position();
   update();
   // .show goes on next frame so the fade-in transition always runs (also
@@ -94,9 +104,9 @@ export function hide() {
   clearTimeout(flipTimer);
   window.removeEventListener('resize', onResize);
   if (!strip) return;
-  // Removing .show also drops pointer-events, so the fading card can
+  // Removing .live/.show drops pointer-events, so the fading card can
   // neither eat a post-drop click nor answer a late hit-test.
-  strip.classList.remove('show');
+  strip.classList.remove('live', 'show');
   clearTimeout(removeTimer);
   removeTimer = setTimeout(() => { if (strip) strip.remove(); }, REMOVE_MS);
 }
@@ -199,14 +209,19 @@ function colorFor(b) {
 // thumbAt returns the page index of the thumbnail at viewport point
 // (x, y), or null. The strip box itself is a cheap pre-filter; points on
 // the card but between thumbs return null so the grid below stays the
-// drop target.
+// drop target. elementsFromPoint walks the whole stack at the point:
+// the drag clone (pointer-events:none) or any other layer above the
+// strip can't shadow a thumbnail — entries that don't resolve to a
+// .thumb are simply skipped.
 function thumbAt(x, y) {
   if (!shown || !strip || !strip.isConnected) return null;
   const r = strip.getBoundingClientRect();
   if (x < r.left || x > r.right || y < r.top || y > r.bottom) return null;
-  const hit = document.elementFromPoint(x, y);
-  const t = hit ? hit.closest('.thumb') : null;
-  return t && strip.contains(t) ? Number(t.dataset.page) : null;
+  for (const el of document.elementsFromPoint(x, y)) {
+    const t = el.closest ? el.closest('.thumb') : null;
+    if (t && strip.contains(t)) return Number(t.dataset.page);
+  }
+  return null;
 }
 
 // setHover tracks which thumb the pointer parks on: entering arms a

@@ -3,16 +3,20 @@
    the pager (the exact `bottom` is set inline from the measured .pager
    top so the strip always clears the dots/arrows row).
 
-   Hit-testing is geometric (document.elementFromPoint in thumbs.js): the
-   drag clone is pointer-events:none so the thumbs below are seen through
-   it. The strip itself keeps pointer-events:none until .show — while it
-   fades out it can neither swallow a click nor answer a hit-test. */
+   Hit-testing is coordinate-based (document.elementsFromPoint in
+   thumbs.js): the drag clone is pointer-events:none AND sits below the
+   strip in z-order, so it can neither block hit-testing nor cover the
+   targets. The strip itself is hit-testable from the instant it mounts
+   (.live, toggled synchronously in show()); .show only animates the
+   opacity fade — on hide() both classes go, so the fading card can
+   neither swallow a click nor answer a hit-test. */
 
 .thumb-strip {
   position: fixed;
   left: 50%;
   bottom: 64px; /* fallback; thumbs.js writes the measured value inline */
-  z-index: 60; /* above viewport edge hints (4) + arrows (5); clone is 100 */
+  z-index: 110; /* above the drag clone (100): the clone may pass under
+                   the strip but never covers or shadows the targets */
   transform: translateX(-50%);
   display: flex;
   gap: 8px;
@@ -33,11 +37,15 @@
   transition: opacity 0.18s ease;
 }
 
+/* Mounted + hit-testable the moment a drag begins — pointer capture on
+   the viewport means the strip can't steal the gesture anyway. Kept
+   separate from .show so the opacity fade never gates hit-testing. */
+.thumb-strip.live {
+  pointer-events: auto;
+}
+
 .thumb-strip.show {
   opacity: 1;
-  /* Hit-testable while the drag runs; pointer capture on the viewport
-     means the strip can't steal the gesture anyway. */
-  pointer-events: auto;
 }
 
 /* ---------- one thumbnail = one page ---------- */
@@ -47,6 +55,14 @@
   /* Mini cell metrics, shrunk by the narrow-viewport media query. */
   --tc: 10px;
   --tg: 2px;
+  /* Hit-area floor: every page target is at least ~64×48 px on desktop
+     (~48×40 under the 640px media query) no matter how small the
+     configured grid makes the mini preview. */
+  min-width: 64px;
+  min-height: 48px;
+  display: flex; /* center the mini grid inside the padded hit area */
+  align-items: center;
+  justify-content: center;
   padding: 5px;
   border-radius: 8px;
   border: 1.5px solid var(--border);
@@ -138,6 +154,8 @@
   .thumb {
     --tc: 7px;
     --tg: 1.5px;
+    min-width: 48px;
+    min-height: 40px;
     padding: 4px;
   }
 }

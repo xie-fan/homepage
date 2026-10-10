@@ -330,8 +330,11 @@ body {
   outline-offset: -3px;
 }
 
-/* Floating clone that follows the pointer (positioned inline in dnd.js). */
+/* Floating clone that follows the pointer (positioned inline in dnd.js).
+   pointer-events:none is an invariant — hit-testing for drop targets
+   must always see through it — so it lives here too, not only inline. */
 .drag-clone {
+  pointer-events: none;
   border-radius: var(--radius);
   background: var(--card);
   box-shadow: 0 14px 34px rgba(15, 23, 42, 0.3);
