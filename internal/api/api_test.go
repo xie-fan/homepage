@@ -482,6 +482,38 @@ func TestMoveCascade(t *testing.T) {
 	}
 }
 
+// TestMoveAppendToFullPage: a thumbnail drop sends a huge index —
+// "append" to a FULL page lands at cap-1: the dropped bookmark takes
+// the last slot and the page's previous tail is pushed to the front of
+// the next page, end to end. (The old clamp to len(page) appended past
+// the tail, so the cascade ejected the dropped bookmark itself.)
+func TestMoveAppendToFullPage(t *testing.T) {
+	srv, st, _ := newTestServer(t)
+	reqJSON(t, srv, http.MethodPut, "/api/settings",
+		map[string]any{"grid": map[string]int{"rows": 3, "cols": 4}}, nil)
+	seed := seedBookmarks(t, st, 25) // cap 12: pages 0,1 full + 1
+
+	// Drop the first page-1 bookmark onto page 0's thumbnail.
+	var list []store.Bookmark
+	code := reqJSON(t, srv, http.MethodPost, "/api/bookmarks/move",
+		map[string]any{"id": seed[12].ID, "page": 0, "index": 1 << 30}, &list)
+	if code != http.StatusOK {
+		t.Fatalf("move = %d, want 200", code)
+	}
+	// b12 takes page 0's last slot; b11 spills to the front of page 1.
+	want := [][]string{
+		append(bookmarkTitles(seed[:11]), seed[12].Title),
+		append([]string{seed[11].Title}, bookmarkTitles(seed[13:24])...),
+		{seed[24].Title},
+	}
+	if got := pageOf(t, list); !samePages(got, want) {
+		t.Fatalf("move response pages = %v, want %v", got, want)
+	}
+	if got := listPages(t, srv); !samePages(got, want) {
+		t.Fatalf("persisted pages = %v, want %v", got, want)
+	}
+}
+
 // TestMoveNewPage: targeting page == len(pages) lands the bookmark on a
 // new last page.
 func TestMoveNewPage(t *testing.T) {

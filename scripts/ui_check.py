@@ -233,13 +233,27 @@ if th and len(th)>=2:
     check('8c drop into full page: its last item cascades to front of next page', L[0]==[U(a[2])]+L0[0][:23] and L[1]==[L0[0][23]]+L0[1][1:], [len(p) for p in L])
     check('8c preview matched committed layout', U(prev[:24])==L[0], prev[:5])
 reset()
-# 8e. thumbnail drop onto a full page: appended, overflow cascades (dragged item lands at front of next page)
+# 8e. thumbnail drop of a page-2 tile onto FULL page 1: becomes page 1's LAST tile, old last pushed to front of page 2
 cmd('Input.dispatchKeyEvent', type='rawKeyDown', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39); cmd('Input.dispatchKeyEvent', type='keyUp', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39); time.sleep(0.8)
-a = tile_xy(1); press(a[0],a[1]); th = thumbs_xy()
+a = tile_xy(0); press(a[0],a[1]); th = thumbs_xy()
 if th:
+    A = U(a[2])
+    exp0 = L0[0][:23] + [A]; exp1 = [L0[0][23]] + [x for x in L0[1] if x != A]
+    path(lerp((a[0]+15,a[1]+15),(th[0][0],th[0][1]),3), 0.01); time.sleep(0.25)  # stay below the 400ms dwell: page 2 still shown
+    prev_pg = ev(page); prev2 = U(shown_ids()) if prev_pg == 1 else None
+    prev_mini = ev("[...document.querySelectorAll('[role=listbox] .thumb')].map(t=>t.querySelectorAll('[data-id],img,.mini,i,span').length)")
+    release(th[0][0],th[0][1])
+    L = lay()
+    check('8e thumbnail drop onto full page: dropped tile is LAST of target, old last cascades to front of next page', L[0]==exp0 and L[1]==exp1, (L[0][-2:], L[1][:2]))
+    check('8e preview (page 2 while hovering page-1 thumbnail) matches committed page 2', prev2 is None or prev2[:len(exp1)]==exp1, (prev_pg, prev2[:3] if prev2 else None))
+reset()
+# 8e2. thumbnail drop onto own full page (page 1 tile -> page-1 thumbnail): moves to end, nothing cascades
+a = tile_xy(3); press(a[0],a[1]); th = thumbs_xy()
+if th:
+    A = U(a[2])
     path(lerp((a[0]+15,a[1]+15),(th[0][0],th[0][1]),3), 0.01); release(th[0][0],th[0][1])
     L = lay()
-    check('8e thumbnail drop on full page cascades', len(L[0])==24 and L[0]==L0[0] and L[1][0]==U(a[2]), L[1])
+    check('8e2 thumbnail drop onto own full page: move to end, no cascade', L[0]==[x for x in L0[0] if x!=A]+[A] and L[1]==L0[1], (L[0][-2:], L[1][:1]))
 reset()
 # 8f. '+' add from page 0 when page 0 is full -> end of page 1; from last full pages -> new page
 r = ev("fetch('/api/bookmarks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:'T1',url:'https://t1.example.org/',page:0})}).then(r=>r.json())")

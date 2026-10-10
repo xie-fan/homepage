@@ -154,8 +154,13 @@ Layout = `[][]int64` (ids per page, in order). All ops return a new layout.
 - `FromFlat(ids, cap)` — fill pages sequentially (migration, import without page info).
 - `Insert(L, id, page, index, cap)` — remove `id` from its current page (that page closes up,
   nothing is pulled from the next page); insert into target `page` (page == len(L) means a new
-  page at the end) at `min(index, len(page))`; then `cascade` from the target page; then drop
-  empty pages. Thumbnail drop = Insert with index = len(page).
+  page at the end) at `min(index, len(page), cap-1)`; then `cascade` from the target page; then
+  drop empty pages. The `cap-1` clamp makes "append to a full page" insert AT the last slot:
+  the dropped tile becomes the page's last tile and the previous last tile is pushed to the
+  front of the next page, cascading as usual (clamping to len(page) instead would eject the
+  dropped tile itself). On a page with room `len(page) <= cap-1` already, so a plain append at
+  its end still results. Thumbnail drop = Insert with a huge index (1e9, clamped); any index
+  past the end — hovering an empty slot, index beyond length — takes the same path.
 - `cascade(L, from, cap)` — for p = from…: while len(L[p]) > cap, pop its last item and push it to
   the FRONT of L[p+1] (creating a new last page if needed).
 - `Add(L, id, fromPage, cap)` — first page p ≥ fromPage with a free slot gets `id` at its end;
@@ -184,7 +189,9 @@ Layout = `[][]int64` (ids per page, in order). All ops return a new layout.
 - Drag preview = `layout.insert(originalLayout, id, hoverPage, hoverIndex, cap)` recomputed from the
   drag-start snapshot on every hover change (never cumulative); pointer outside grid/thumbnails →
   preview shows the original layout (matches cancel on release). Drop → `POST /api/bookmarks/move`,
-  adopt the returned list (server is the source of truth). Hovering an empty slot → index = len(page).
+  adopt the returned list (server is the source of truth). Hovering an empty slot → index =
+  len(page without the dragged id) — always ≤ cap-1, so it lands inside the page; a thumbnail →
+  index 1e9 → the page's last slot (cap-1 on a full page, tail cascades).
 - Add sends `page: currentPage`; afterwards go to the new bookmark's page and highlight it.
 - Search view unchanged (flat filtered list, drag disabled).
 

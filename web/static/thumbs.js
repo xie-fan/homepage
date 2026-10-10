@@ -20,9 +20,10 @@
 // Behaviour: parking the pointer ~400ms on a thumbnail flips the main
 // view to that page (one shot per entry) so the tile can be dropped at a
 // precise slot; while a thumb is under the pointer dnd.js disarms the
-// edge-flip zones and previews the item appended to that page. A release
+// edge-flip zones and previews the item in that page's last slot. A release
 // over a thumbnail is resolved by dnd.js through dropPage(): the item
-// moves to the END of that page (index 1e9 — the server clamps it), and
+// moves to that page's LAST slot (index 1e9 → clamped to cap-1 on a
+// full page, so its previous tail cascades forward), and
 // a release on "+ 新页" targets page = number of pages. Thumbs report
 // DISPLAYED page indices; dnd.js translates them into layout indices.
 // hide() fades the strip out and clears every timer and the resize hook

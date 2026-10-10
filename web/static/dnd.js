@@ -22,8 +22,9 @@
 //   • over an empty slot on page p → index len(L0[p] without the dragged
 //     id); unified with the tile rule as index = min(cell, that length)
 //   • the dashed "+ 新页" page      → a new last page: page = len(L0)
-//   • a page thumbnail             → index 1e9 (the server clamps it to
-//     the end of the page; the preview does the same)
+//   • a page thumbnail             → index 1e9 (insert() and the server
+//     clamp it to min(len, cap-1): the item takes the page's LAST slot
+//     and a full page's previous tail cascades to the next page)
 //   • anywhere outside the current page's padded grid and the thumbnails
 //     → preview = L0, so what you see is what a cancel restores
 //
@@ -150,9 +151,10 @@ function move(x, y) {
   dnd.y = y;
   positionClone(x, y);
   // A page thumbnail under the pointer owns it: the preview shows the
-  // item appended to that page (index 1e9 — the very value a drop
-  // sends; insert() clamps it to the end just like the server does)
-  // and the edge zones are disarmed until the pointer moves off.
+  // item in that page's last slot (index 1e9 — the very value a drop
+  // sends; insert() clamps it to cap-1 on a full page so the tail
+  // cascades, just like the server) and the edge zones are disarmed
+  // until the pointer moves off.
   const tp = thumbs.move(x, y);
   if (tp !== null) {
     setEdge(0);
@@ -172,8 +174,9 @@ async function drop() {
   const up = lastUp && performance.now() - lastUp.t < 250 ? lastUp : dnd;
   const x = up.x;
   const y = up.y;
-  // A release on a page thumbnail moves the item to the END of that
-  // page (the strip is still mounted here — cleanup() hides it below).
+  // A release on a page thumbnail moves the item to that page's LAST
+  // slot — on a full page its tail cascades to the next page's front
+  // (the strip is still mounted here — cleanup() hides it below).
   // A release over the current page's grid commits the same {page,index}
   // the live preview just used, so what the placeholder showed is what
   // persists. A release anywhere else cancels the drag like Esc.

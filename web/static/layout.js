@@ -44,10 +44,14 @@ function cascade(L, from, cap) {
 // insert moves `id` to (page, index): the id is first removed from its
 // current page — that page closes up and NOTHING is pulled from the next
 // page — then inserted into the target page (page == L.length means a new
-// page at the end) at min(index, len(page)). Overflow cascades forward
-// from the target page; pages left empty are dropped at the end.
-// A thumbnail drop is insert with index = len(page), so any index past
-// the end (e.g. the drag code's 1e9) clamps there.
+// page at the end) at min(index, len(page), cap-1). Overflow cascades
+// forward from the target page; pages left empty are dropped at the end.
+// Clamping to cap-1 makes "append to a full page" land in its LAST slot:
+// the dropped tile becomes the last tile and the page's previous tail is
+// pushed to the front of the next page (cascading as usual); on a page
+// with room len(page) <= cap-1 already, so it still appends at the end.
+// A thumbnail drop is insert with a huge index (the drag code's 1e9)
+// that clamps into the page's last slot either way.
 export function insert(L, id, page, index, cap) {
   cap = normCap(cap);
   const out = copy(L);
@@ -60,7 +64,7 @@ export function insert(L, id, page, index, cap) {
   }
   const t = Math.min(Math.max(0, page), out.length);
   if (t === out.length) out.push([]);
-  const at = Math.min(Math.max(0, index), out[t].length);
+  const at = Math.min(Math.max(0, index), out[t].length, cap - 1);
   out[t].splice(at, 0, id);
   cascade(out, t, cap);
   return dropEmpty(out);
