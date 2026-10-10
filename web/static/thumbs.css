@@ -1,0 +1,149 @@
+/* thumbs.css — page-thumbnail strip shown during a tile drag (Task F8).
+   thumbs.js mounts .thumb-strip on <body>, fixed and centered just above
+   the pager (the exact `bottom` is set inline from the measured .pager
+   top so the strip always clears the dots/arrows row).
+
+   Hit-testing is geometric (document.elementFromPoint in thumbs.js): the
+   drag clone is pointer-events:none so the thumbs below are seen through
+   it. The strip itself keeps pointer-events:none until .show — while it
+   fades out it can neither swallow a click nor answer a hit-test. */
+
+.thumb-strip {
+  position: fixed;
+  left: 50%;
+  bottom: 64px; /* fallback; thumbs.js writes the measured value inline */
+  z-index: 60; /* above viewport edge hints (4) + arrows (5); clone is 100 */
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+  max-width: calc(100vw - 24px); /* internal scroll, never body overflow */
+  padding: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--card);
+  box-shadow: var(--shadow);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+
+.thumb-strip.show {
+  opacity: 1;
+  /* Hit-testable while the drag runs; pointer capture on the viewport
+     means the strip can't steal the gesture anyway. */
+  pointer-events: auto;
+}
+
+/* ---------- one thumbnail = one page ---------- */
+
+.thumb {
+  flex: 0 0 auto;
+  /* Mini cell metrics, shrunk by the narrow-viewport media query. */
+  --tc: 10px;
+  --tg: 2px;
+  padding: 5px;
+  border-radius: 8px;
+  border: 1.5px solid var(--border);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+}
+
+.thumb-grid {
+  display: grid;
+  /* --t-rows/--t-cols are set inline per thumb by thumbs.js. */
+  grid-template-columns: repeat(var(--t-cols, 6), var(--tc));
+  grid-template-rows: repeat(var(--t-rows, 4), var(--tc));
+  gap: var(--tg);
+}
+
+.thumb-cell {
+  width: var(--tc);
+  height: var(--tc);
+  border-radius: 2px;
+  /* Empty slot: a faint square; icon cells get an inline background. */
+  background: color-mix(in srgb, var(--fg) 13%, transparent);
+  background-size: cover;
+  background-position: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.thumb-cell--icon {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 12%, transparent);
+}
+
+/* No fetched icon: a colored dot (color set inline, avatar palette). */
+.thumb-dot {
+  display: block;
+  width: 60%;
+  height: 60%;
+  border-radius: 50%;
+}
+
+/* The dragged bookmark's live slot, echoing .tile.tile-source. */
+.thumb-cell--src {
+  outline: 1.5px dashed var(--accent);
+  outline-offset: -1px;
+}
+
+/* Current page (accent border) and the page under the pointer. */
+.thumb--current {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.thumb--hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+/* The "+ 新页" target (only present while the last page is full): dashed
+   empty cells with a centered "+", mirroring the grid's .tile.drop-slot. */
+.thumb--new {
+  border-style: dashed;
+}
+
+.thumb--new .thumb-cell {
+  background: transparent;
+  border: 1px dashed color-mix(in srgb, var(--fg) 30%, transparent);
+}
+
+.thumb-plus {
+  grid-column: 1 / -1;
+  grid-row: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* Narrow screens: smaller thumbnails; the strip scrolls horizontally
+   when the pages don't fit. */
+@media (max-width: 640px) {
+  .thumb-strip {
+    gap: 6px;
+    padding: 6px;
+    max-width: calc(100vw - 16px);
+  }
+
+  .thumb {
+    --tc: 7px;
+    --tg: 1.5px;
+    padding: 4px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thumb-strip {
+    transition: none; /* thumbs.js removes it on a timer, not transitionend */
+  }
+}

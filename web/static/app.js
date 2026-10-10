@@ -11,6 +11,7 @@ const state = {
   grid: { rows: 4, cols: 6 },
   spacing: 'normal', // one of SPACING_VALUES; drives the layout preset
   page: 0,
+  query: '', // search.js filter text; '' = normal (unfiltered) mode
   editing: null, // bookmark in the modal; null while adding
   loadError: null,
 };
@@ -59,6 +60,7 @@ const ERROR_MESSAGES = {
   import_too_large: '导入的书签太多（最多 5000 个）',
   not_found: '书签不存在，可能已被删除',
   invalid_order: '排序失败，请刷新后重试',
+  search_active: '搜索时无法排序',
   internal: '服务器出错了，请稍后重试',
   network: '网络错误，请检查连接',
 };
@@ -88,7 +90,8 @@ function el(tag, className, text) {
 // ---------- geometry ----------
 
 const pageSize = () => state.grid.rows * state.grid.cols;
-const pageCount = () => Math.max(1, Math.ceil(state.bookmarks.length / pageSize()));
+const pageCount = () =>
+  Math.max(1, Math.ceil(visibleBookmarks().length / pageSize()));
 // While a tile drag runs on a full last page, dnd.js asks for one extra
 // empty page so an item can be carried "past the end" — a drop there lands
 // at the tail of the flat position list.
@@ -215,22 +218,27 @@ function render() {
   if ((!drag || !drag.active) && !(tileDnd && tileDnd.active())) {
     offsetTrack(0, false);
   }
+  // search.js re-clamps/re-marks its selection in case a poll, edit or
+  // import changed the filtered list under it.
+  if (searchHooks && searchHooks.afterRender) searchHooks.afterRender();
 }
 
 function renderTrack() {
   els.track.replaceChildren();
   const size = pageSize();
+  const list = visibleBookmarks();
   for (let p = 0; p < displayPageCount(); p++) {
     const page = el('div', 'page');
     // --cols/--rows feed the repeat()s in style.css; the track sizes
     // (--tile-w/--tile-h) come from layout() so the grid always fits.
     page.style.setProperty('--cols', state.grid.cols);
     page.style.setProperty('--rows', state.grid.rows);
-    const items = state.bookmarks.slice(p * size, (p + 1) * size);
+    const items = list.slice(p * size, (p + 1) * size);
     if (items.length === 0) {
       if (p === 0) {
         page.append(el('p', 'empty',
-          state.loadError ? `加载失败：${state.loadError}` : '还没有书签，点击 + 添加'));
+          isFiltering() ? '没有匹配的书签'
+            : state.loadError ? `加载失败：${state.loadError}` : '还没有书签，点击 + 添加'));
       } else {
         // The extra last page shown during a drag on a full grid: a dashed
         // slot marks it as a valid "new page" drop target.
@@ -246,8 +254,15 @@ function renderTrack() {
 function makeTile(b) {
   const tile = el('div', 'tile');
   tile.dataset.id = String(b.id); // Task 7 (drag & drop) hooks onto data-id
+  tile.id = `tile-${b.id}`; // search.js aria-activedescendant target
   // The dragged item stays in the list; its slot renders as the placeholder.
   if (tileDnd && tileDnd.draggingId() === b.id) tile.classList.add('tile-source');
+  // search.js marks the selected result (only active while filtering).
+  if (searchHooks && searchHooks.selectedId() === b.id) {
+    tile.classList.add('tile-selected');
+    tile.setAttribute('aria-selected', 'true');
+    tile.setAttribute('aria-current', 'true');
+  }
 
   const link = el('a', 'tile-link');
   link.href = b.url; // real anchor: Ctrl/Cmd/middle click opens a new tab natively
@@ -513,7 +528,7 @@ function onPointerDown(e) {
   // converts to a swipe — so a flick on a tile still flips the page and a
   // tap stays a link click. (A touch hold now drags instead of opening the
   // editor; the always-visible ✎ button covers editing.)
-  if (tileEl && tileEl.dataset.id && !e.target.closest('.tile-edit')) {
+  if (tileEl && tileEl.dataset.id && !e.target.closest('.tile-edit') && !isFiltering()) {
     drag.mode = 'tile-pending';
     drag.tileId = Number(tileEl.dataset.id);
     if (e.pointerType !== 'mouse') pressTimer = setTimeout(startTileDrag, TILE_HOLD_MS);
@@ -525,7 +540,8 @@ function onPointerDown(e) {
 function startTileDrag() {
   if (!drag || drag.mode !== 'tile-pending') return;
   const bm = tileDnd && state.bookmarks.find((b) => b.id === drag.tileId);
-  if (!bm) {
+  // Filtering also forbids a drag (reorder of a partial list is invalid).
+  if (!bm || isFiltering()) {
     drag.mode = null; // can't drag — let the gesture fall back to a swipe
     return;
   }
@@ -780,7 +796,7 @@ async function onBookmarkSubmit(e) {
 // so the eye finds it. The .tile-new ring is CSS (~1.5s); under
 // prefers-reduced-motion it shows as a static outline instead.
 function revealNewTile(id) {
-  const index = state.bookmarks.findIndex((b) => b.id === id);
+  const index = visibleBookmarks().findIndex((b) => b.id === id);
   if (index < 0) return;
   goToPage(Math.floor(index / pageSize()));
   const tile = els.track.querySelector(`.tile[data-id="${id}"]`);
@@ -993,11 +1009,78 @@ export function registerTileDnd(handlers) { tileDnd = handlers; }
 // Task 7 hook: persist a new order as the full id list in display order
 // (tiles carry data-id; collect them left-to-right across pages).
 export async function persistOrder(ids) {
+  // Refuse while filtering: dnd would pass the visible (partial) list.
+  if (isFiltering()) {
+    const err = new Error('reorder is disabled while filtering');
+    err.code = 'search_active';
+    throw err;
+  }
   state.bookmarks = await api.reorder(ids);
   render();
 }
 
-export { state, pageSize, render, goToPage, refresh, showToast, friendlyError };
+// ---------- search (search.js) ----------
+//
+// Filtering reuses the whole paging machinery: state.query selects the
+// subset of bookmarks shown, pageCount()/renderTrack() read it through
+// visibleBookmarks(), and dots/arrows/wheel/keys page the result set.
+// search.js owns the input, the selection index and announcements; it
+// reaches tiles through the hooks registered below (imports stay one-way,
+// same pattern as dnd.js).
+let searchHooks = null;
+export function registerSearch(hooks) { searchHooks = hooks; }
+
+export function isFiltering() { return state.query !== ''; }
+
+// Case-insensitive substring match on title, URL and host; the host also
+// matches after dropping a leading "www.".
+function matchesQuery(b, q) {
+  if ((b.title || '').toLowerCase().includes(q) ||
+      (b.url || '').toLowerCase().includes(q)) return true;
+  const host = hostOf(b.url).toLowerCase();
+  return host.includes(q) || host.replace(/^www\./, '').includes(q);
+}
+
+export function visibleBookmarks() {
+  if (!isFiltering()) return state.bookmarks;
+  const q = state.query.toLowerCase();
+  return state.bookmarks.filter((b) => matchesQuery(b, q));
+}
+
+// A tile drag is running (or fully owned by dnd.js): used by search.js to
+// leave gestures alone — typing must not steal keys mid-drag.
+export function isTileDragActive() {
+  return Boolean((drag && drag.mode === 'tile') || (tileDnd && tileDnd.active()));
+}
+
+// The page the user was on when filtering started; restored when the
+// query empties again.
+let pageBeforeSearch = 0;
+
+// setQuery is the single entry point for query changes (search.js calls it
+// from input/keydown handlers). Entering filter mode aborts any running
+// gesture (a live reorder would be operating on the full list), remembers
+// the current page and jumps to result page 0; emptying the query returns
+// to normal mode on the remembered page.
+export function setQuery(q) {
+  const next = q == null ? '' : String(q);
+  if (next === state.query) return;
+  const entering = next !== '' && state.query === '';
+  const leaving = next === '' && state.query !== '';
+  state.query = next;
+  if (entering) {
+    pageBeforeSearch = state.page;
+    if (tileDnd && tileDnd.active()) cancelTileDrag();
+    else if (drag) abortGesture();
+    state.page = 0;
+  } else if (leaving) {
+    state.page = pageBeforeSearch;
+  }
+  render();
+}
+
+export { state, pageSize, render, goToPage, refresh, showToast, friendlyError,
+  modalOpen, isEditable };
 
 // ---------- events & boot ----------
 
@@ -1070,3 +1153,10 @@ async function init() {
 }
 
 init();
+
+// Read-only peek for headless tests (they may drive setQuery/goToPage).
+if (!window.__homepage) {
+  window.__homepage = {
+    state, isFiltering, visibleBookmarks, setQuery, goToPage,
+  };
+}

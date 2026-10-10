@@ -1,3 +1,3 @@
 # Status
 
-Round 5 (spacing +10%) committed.
+Round 6 (hover edit, type-to-search, drag thumbnails) committed. UI checks: scripts/ui_check.py

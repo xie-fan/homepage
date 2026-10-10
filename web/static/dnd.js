@@ -8,6 +8,11 @@
 // the bookmark list is reordered live, and hovering a viewport edge flips
 // pages. drop() persists the order; cancel() reverts it.
 //
+// While a drag runs, thumbs.js mounts a strip of page thumbnails above
+// the pager: parking on one dwells toward a page flip (a thumb under the
+// pointer disarms both the in-grid reorder and the edge zones), and
+// releasing on one lands the item at the end of that page.
+//
 // Imports are one-way — app.js never imports this file; it calls the
 // handlers registered at the bottom. index.html loads both modules.
 
@@ -15,6 +20,7 @@ import {
   state, pageSize, render, goToPage, refresh, showToast, friendlyError,
   persistOrder, registerTileDnd,
 } from './app.js';
+import * as thumbs from './thumbs.js';
 
 const EDGE_DWELL_MS = 700; // dwell time per edge flip (repeats while held)
 const CLONE_SCALE = 1.05; // slight zoom on the floating clone
@@ -51,6 +57,7 @@ function begin(x, y, bm) {
   makeClone(src, x, y);
   document.body.classList.add('dnd-active');
   render();   // source slot re-renders as the dashed placeholder
+  thumbs.show(dnd.id); // page-thumbnail strip above the pager
   move(x, y); // evaluate the slot already under the pointer
 }
 
@@ -59,6 +66,13 @@ function move(x, y) {
   dnd.x = x;
   dnd.y = y;
   positionClone(x, y);
+  // A page thumbnail under the pointer owns it: the grid reorder stays
+  // put (hovering must not scramble the order) and the edge zones are
+  // disarmed — the strip wins over both until the pointer moves off it.
+  if (thumbs.move(x, y) !== null) {
+    setEdge(0);
+    return;
+  }
   updateEdge(x, y);
   updateTarget(x, y);
 }
@@ -66,6 +80,13 @@ function move(x, y) {
 async function drop() {
   if (!dnd) return;
   const { original } = dnd;
+  // A release on a page thumbnail moves the item to the END of that page
+  // (the strip is still mounted here — cleanup() hides it below).
+  const page = thumbs.dropPage(dnd.x, dnd.y);
+  if (page !== null) {
+    moveToPageEnd(page);
+    goToPage(page); // land the view where the drop went (clamps itself)
+  }
   const changed = state.bookmarks.some((b, i) => b.id !== original[i].id);
   cleanup();
   if (!changed) return; // landed back where it started: nothing to save
@@ -142,6 +163,23 @@ function updateTarget(x, y) {
   const [bm] = state.bookmarks.splice(from, 1);
   state.bookmarks.splice(to, 0, bm);
   render(); // the placeholder rides along to the item's new slot
+  thumbs.update(); // the mini pages mirror the live order too
+}
+
+// moveToPageEnd splices the dragged bookmark to the last slot of page p —
+// index min((p+1)·size − 1, n−1) in the FINAL array, so the "+ 新页"
+// thumbnail (one past the last real page) clamps to the very end. `to` is
+// already adjusted for the removed item: after splice(from, 1) an insert
+// at `to` puts the item exactly on that index whichever side it came
+// from.
+function moveToPageEnd(p) {
+  const list = state.bookmarks;
+  const from = list.findIndex((b) => b.id === dnd.id);
+  if (from < 0) return;
+  const to = Math.min((p + 1) * pageSize() - 1, list.length - 1);
+  if (from === to) return;
+  const [bm] = list.splice(from, 1);
+  list.splice(to, 0, bm);
 }
 
 // cellIndexAt finds which grid cell of a .page contains (x, y). The page
@@ -204,7 +242,13 @@ function setEdgeHint(dir) {
 }
 
 function updateEdge(x, y) {
-  const dir = edgeDirAt(x, y);
+  setEdge(edgeDirAt(x, y));
+}
+
+// setEdge applies a resolved edge direction: entering a zone arms the
+// dwell timer, leaving it disarms it. move() also calls this with 0 while
+// a page thumbnail owns the pointer so the strip beats the edge zones.
+function setEdge(dir) {
   if (dir === dnd.edgeDir) return;
   dnd.edgeDir = dir;
   setEdgeHint(dir);
@@ -219,6 +263,7 @@ function edgeFlip(dir) {
   // At the bound nothing flips; the timer stays disarmed until the
   // pointer leaves and re-enters the zone (edgeDir keeps the direction).
   if (state.page === before) return;
+  thumbs.update(); // move the strip's current-page marker to the new page
   updateTarget(dnd.x, dnd.y); // the page under the pointer just changed
   // Keep flipping while the pointer stays parked in the edge zone.
   dnd.edgeTimer = setTimeout(() => edgeFlip(dir), EDGE_DWELL_MS);
@@ -231,6 +276,7 @@ function cleanup() {
   dnd.clone?.remove();
   dnd = null;
   document.body.classList.remove('dnd-active', 'dnd-edge-left', 'dnd-edge-right');
+  thumbs.hide(); // fades the strip; clears its dwell timer + resize hook
   render(); // clears the placeholder marking and the extra drag page
 }
 

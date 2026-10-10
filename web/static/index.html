@@ -7,12 +7,19 @@
   <title>Homepage</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/thumbs.css">
+  <link rel="stylesheet" href="/search.css">
   <script type="module" src="/app.js"></script>
   <script type="module" src="/dnd.js"></script>
+  <script type="module" src="/search.js"></script>
 </head>
 <body>
   <header class="topbar">
     <h1 class="topbar-title">Homepage</h1>
+    <div class="topbar-search">
+      <input id="search-input" type="search" aria-label="搜索书签"
+        placeholder="搜索书签…  直接输入即可" autocomplete="off" spellcheck="false">
+    </div>
     <div class="topbar-actions">
       <button id="btn-add" class="btn" type="button">+ 添加</button>
       <button id="btn-settings" class="btn btn-icon" type="button" aria-label="设置" title="设置">⚙</button>
@@ -20,6 +27,7 @@
   </header>
 
   <main id="app">
+    <p id="search-status" class="sr-only" role="status" aria-live="polite"></p>
     <div id="viewport" class="viewport">
       <div id="track" class="track"></div>
     </div>

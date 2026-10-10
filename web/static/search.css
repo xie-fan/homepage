@@ -1,0 +1,80 @@
+/* search.css — header search box, keyboard-selection ring, a11y helpers.
+   Loaded after style.css and reuses its theme variables (light/dark come
+   for free). The topbar switches to a 3-column grid so the box sits truly
+   centered between the title and the action buttons; below 600px it wraps
+   to a full-width second row so nothing ever overlaps. */
+
+.topbar {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  column-gap: 12px;
+}
+
+.topbar-actions {
+  justify-self: end;
+}
+
+.topbar-search {
+  justify-self: center;
+  min-width: 0;
+  width: clamp(150px, 30vw, 340px);
+}
+
+@media (max-width: 600px) {
+  .topbar {
+    grid-template-columns: 1fr auto;
+    row-gap: 10px;
+  }
+
+  .topbar-search {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+  }
+}
+
+#search-input {
+  width: 100%;
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--field-bg);
+  color: var(--fg);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+#search-input::placeholder {
+  color: var(--muted);
+  opacity: 0.75;
+}
+
+#search-input:hover {
+  border-color: var(--muted);
+}
+
+#search-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* Keyboard selection on a filtered grid: a focus-style ring marks the
+   result Enter would open (search.js toggles the class). */
+.tile-selected .tile-link {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+
+/* Visually hidden but announced: the aria-live result-count region. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
