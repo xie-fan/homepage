@@ -122,13 +122,8 @@ function displayPages() {
 }
 
 const pageCount = () => displayPages().length;
-// While a tile drag runs, dnd.js may ask for one extra empty page at the
-// end — the dashed "+ 新页" drop target (a drop there starts a new page).
-const wantsExtra = () =>
-  Boolean(tileDnd && tileDnd.wantsExtraPage && tileDnd.wantsExtraPage());
-const displayPageCount = () => pageCount() + (wantsExtra() ? 1 : 0);
 const clampPage = () => {
-  state.page = Math.min(Math.max(state.page, 0), displayPageCount() - 1);
+  state.page = Math.min(Math.max(state.page, 0), pageCount() - 1);
 };
 
 // ---------- layout ----------
@@ -195,7 +190,7 @@ function layout() {
   // they sit in the pager row and a slim edge inset is enough.
   const overlay =
     getComputedStyle(els.navPrev).position === 'absolute' &&
-    displayPageCount() > 1;
+    pageCount() > 1;
   const padX = overlay ? 64 : 12;
   const padY = 12;
   const availW = vw - 2 * padX;
@@ -256,18 +251,13 @@ function render() {
 function renderTrack() {
   els.track.replaceChildren();
   const pages = displayPages();
-  for (let p = 0; p < displayPageCount(); p++) {
+  for (let p = 0; p < pages.length; p++) {
     const page = el('div', 'page');
     // --cols/--rows feed the repeat()s in style.css; the track sizes
     // (--tile-w/--tile-h) come from layout() so the grid always fits.
     page.style.setProperty('--cols', state.grid.cols);
     page.style.setProperty('--rows', state.grid.rows);
-    if (p >= pages.length) {
-      // The extra "+ 新页" page shown while a tile drag runs: a dashed
-      // slot marks it as a valid "new page" drop target.
-      page.dataset.extra = '1';
-      page.append(el('div', 'tile drop-slot'));
-    } else if (pages[p].length === 0) {
+    if (pages[p].length === 0) {
       if (p === 0) {
         page.append(el('p', 'empty',
           isFiltering() ? '没有匹配的书签'
@@ -407,7 +397,7 @@ function hashStr(s) {
 
 function renderDots() {
   els.dots.replaceChildren();
-  for (let i = 0; i < displayPageCount(); i++) {
+  for (let i = 0; i < pageCount(); i++) {
     const dot = el('button', 'dot');
     dot.type = 'button';
     dot.setAttribute('aria-label', `第 ${i + 1} 页`);
@@ -419,13 +409,13 @@ function renderDots() {
 
 function updateArrows() {
   els.navPrev.disabled = state.page <= 0;
-  els.navNext.disabled = state.page >= displayPageCount() - 1;
+  els.navNext.disabled = state.page >= pageCount() - 1;
 }
 
 // ---------- navigation ----------
 
 function goToPage(i) {
-  state.page = Math.min(Math.max(i, 0), displayPageCount() - 1);
+  state.page = Math.min(Math.max(i, 0), pageCount() - 1);
   offsetTrack(0, true);
   renderDots();
   updateArrows();
@@ -436,6 +426,16 @@ function offsetTrack(dx, animate) {
   const w = els.viewport.clientWidth || 1;
   els.track.classList.toggle('no-anim', !animate);
   els.track.style.transform = `translateX(${-state.page * w + dx}px)`;
+}
+
+// settleTrack instantly finishes any in-flight page slide: transition
+// off, the settled transform re-applied and committed with a forced
+// reflow, then the transition restored. A press landing while the slide
+// runs — and every hit test it feeds — then sees settled positions.
+function settleTrack() {
+  offsetTrack(0, false);
+  void els.track.offsetWidth; // commit the snap before re-enabling
+  els.track.classList.remove('no-anim');
 }
 
 // ---------- wheel & keys ----------
@@ -543,7 +543,13 @@ function onPointerDown(e) {
   suppressClickUntil = 0;
   suppressReleaseId = -1;
   if (modalOpen()) return;
-  const tileEl = e.target.closest('.tile');
+  // The page slide may still be animating: snap the track to its settled
+  // position, then hit-test THERE — e.target was resolved against the
+  // mid-flight geometry (a displaced tile, or the gap between sliding
+  // pages) and can miss the tile the press point sits on once settled.
+  settleTrack();
+  const hit = document.elementFromPoint(e.clientX, e.clientY);
+  const tileEl = hit ? hit.closest('.tile') : null;
   drag = {
     pointerId: e.pointerId,
     startX: e.clientX, startY: e.clientY,
@@ -559,7 +565,7 @@ function onPointerDown(e) {
   // converts to a swipe — so a flick on a tile still flips the page and a
   // tap stays a link click. (A touch hold now drags instead of opening the
   // editor; the always-visible ✎ button covers editing.)
-  if (tileEl && tileEl.dataset.id && !e.target.closest('.tile-edit') && !isFiltering()) {
+  if (tileEl && tileEl.dataset.id && !hit.closest('.tile-edit') && !isFiltering()) {
     drag.mode = 'tile-pending';
     drag.tileId = Number(tileEl.dataset.id);
     if (e.pointerType !== 'mouse') pressTimer = setTimeout(startTileDrag, TILE_HOLD_MS);
@@ -1150,7 +1156,7 @@ export function setQuery(q) {
 }
 
 export { state, pageSize, render, goToPage, refresh, showToast, friendlyError,
-  modalOpen, isEditable, displayPages };
+  modalOpen, isEditable, displayPages, settleTrack };
 
 // ---------- events & boot ----------
 

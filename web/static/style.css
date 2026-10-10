@@ -323,18 +323,14 @@ body {
   visibility: hidden;
 }
 
-/* The extra last page offered while dragging on a full grid. */
-.tile.drop-slot {
-  border-radius: var(--radius);
-  outline: 2px dashed var(--border);
-  outline-offset: -3px;
-}
-
-/* Floating clone that follows the pointer (positioned inline in dnd.js).
-   pointer-events:none is an invariant — hit-testing for drop targets
-   must always see through it — so it lives here too, not only inline. */
+/* Floating clone that follows the pointer (positioned inline in dnd.js
+   by a rAF loop). Two invariants live here so they can't regress: it is
+   pointer-events:none (hit-testing for drop targets must always see
+   through it) and it never transitions — any transform animation would
+   make the ghost trail the pointer. */
 .drag-clone {
   pointer-events: none;
+  transition: none !important;
   border-radius: var(--radius);
   background: var(--card);
   box-shadow: 0 14px 34px rgba(15, 23, 42, 0.3);

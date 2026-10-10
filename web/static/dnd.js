@@ -21,7 +21,6 @@
 //   • over a tile at slot i        → index i
 //   • over an empty slot on page p → index len(L0[p] without the dragged
 //     id); unified with the tile rule as index = min(cell, that length)
-//   • the dashed "+ 新页" page      → a new last page: page = len(L0)
 //   • a page thumbnail             → NOT a target: thumbs only switch
 //     the viewed page after a ~400ms dwell so the drag can continue
 //     into that page's grid; a release on one cancels the drag
@@ -46,7 +45,7 @@
 
 import {
   state, pageSize, render, goToPage, showToast, friendlyError,
-  commitMove, registerTileDnd,
+  commitMove, registerTileDnd, settleTrack,
 } from './app.js';
 import { insert, toLayout } from './layout.js';
 import * as thumbs from './thumbs.js';
@@ -67,8 +66,10 @@ const track = document.getElementById('track');
 // exactly what a drop POSTs. `page` is the view at drag start (cancel
 // restores it), `srcPage` the dragged id's L0 page. offX/offY is the
 // grab point inside the tile so the clone keeps that offset while
-// following the pointer.
-let dnd = null; // {id, L0, preview, target, page, srcPage, clone, offX, offY, x, y, edgeDir, edgeTimer}
+// following the pointer. x/y are the LATEST pointer coords; the raf loop
+// rewrites the ghost position and re-scores the hover from them once a
+// frame, so fast motion can never leave the ghost behind.
+let dnd = null; // {id, L0, preview, target, page, srcPage, clone, offX, offY, x, y, edgeDir, edgeTimer, raf}
 
 // Viewport point of the latest primary pointerup. pointermove events
 // coalesce, so on a fast release the last move dnd.js processed can lag
@@ -99,9 +100,9 @@ function sameLayout(a, b) {
 // insert() and the move endpoint expect. They differ only when the
 // dragged bookmark was the sole item of its L0 page and the preview
 // moved it off: that page no longer exists and displayed pages after it
-// sit one lower. The "+ 新页" targets — index len(preview) — land on
-// len(L0), the "new page" the server understands; anything past the end
-// clamps there too.
+// sit one lower. A displayed page past L0's end — the preview grew a
+// cascaded last page — clamps to len(L0), the "new page" index the
+// server understands.
 function mapPage(i) {
   const shifted = dnd.preview.length < dnd.L0.length;
   const p = shifted && i >= dnd.srcPage ? i + 1 : i;
@@ -114,15 +115,25 @@ function mapPage(i) {
 function setPreview(L, target) {
   dnd.target = target;
   if (sameLayout(L, dnd.preview)) return;
+  const viewed = state.page;
   dnd.preview = L;
   render();        // pages render from the preview via displayPages()
   thumbs.update(); // the mini pages mirror the preview too
+  // The preview may have dropped the viewed page (the dragged item was
+  // its only bookmark): render() clamps state.page but skips the track
+  // offset while a drag runs — re-snap so the view actually matches.
+  if (state.page !== viewed) settleTrack();
 }
 
 // ---------- handlers called by app.js ----------
 
 function begin(x, y, bm) {
   if (dnd) return;
+  // The page slide may still be animating (the press that qualified can
+  // itself have landed mid-slide): snap the track to its settled
+  // position first — the clone rect below and every hit test afterwards
+  // must see settled positions.
+  settleTrack();
   const src = track.querySelector(`.tile[data-id="${bm.id}"]`);
   if (!src) return; // tile vanished between pointerdown and drag start
   const L0 = toLayout(state.bookmarks);
@@ -138,19 +149,35 @@ function begin(x, y, bm) {
     offX: 0, offY: 0,
     edgeDir: 0, edgeTimer: 0,
     clone: null,
+    raf: 0,
   };
   makeClone(src, x, y);
   document.body.classList.add('dnd-active');
   render();   // source slot re-renders as the dashed placeholder
   thumbs.show(dnd.id); // page-thumbnail strip above the pager
-  move(x, y); // evaluate the slot already under the pointer
+  move(x, y); // arm the per-frame ghost/hover pass
 }
 
 function move(x, y) {
   if (!dnd) return;
   dnd.x = x;
   dnd.y = y;
-  positionClone(x, y);
+  // The rAF loop does the visible work: one ghost write plus one
+  // hover/target pass per frame, always from the LATEST coords. Scoring
+  // the hover synchronously per event — and its full preview re-render —
+  // let fast motion outrun the ghost (QA: it once stalled mid-slide over
+  // the strip). Chrome already rAF-aligns pointermove, so the delivered
+  // coords are the freshest; coalesced intermediates would only repeat
+  // this same tick.
+  if (!dnd.raf) dnd.raf = requestAnimationFrame(tick);
+}
+
+// tick is the per-frame pass while a drag runs: position the ghost from
+// the latest pointer coords, then re-resolve whatever those coords
+// hover (thumbnail → edge zone → grid cell).
+function tick() {
+  if (!dnd) return;
+  positionClone(dnd.x, dnd.y);
   // A point that is actually ON a thumbnail belongs to the strip:
   // thumbs.move() tracks the hover and arms the page-flip dwell, the
   // edge zones stay disarmed, and the preview reverts to L0 — thumbs
@@ -159,16 +186,17 @@ function move(x, y) {
   // else — on the strip card but between thumbs included — fall through
   // to the grid, so cells the fixed strip overlaps on short viewports
   // stay reachable. state.page is read live inside updateTarget, so the
-  // first move after a thumbnail/edge flip already hit-tests the NEW
+  // first tick after a thumbnail/edge flip already hit-tests the NEW
   // page (gridMetrics uses its settled box, not the animating rect).
-  const tp = thumbs.move(x, y);
+  const tp = thumbs.move(dnd.x, dnd.y);
   if (tp !== null) {
     setEdge(0);
     setPreview(dnd.L0, null);
-    return;
+  } else {
+    updateEdge(dnd.x, dnd.y);
+    updateTarget(dnd.x, dnd.y);
   }
-  updateEdge(x, y);
-  updateTarget(x, y);
+  dnd.raf = requestAnimationFrame(tick);
 }
 
 async function drop() {
@@ -241,7 +269,7 @@ function makeClone(src, x, y) {
 function positionClone(x, y) {
   if (!dnd.clone) return;
   dnd.clone.style.transform =
-    `translate(${x - dnd.offX}px, ${y - dnd.offY}px) scale(${CLONE_SCALE})`;
+    `translate3d(${x - dnd.offX}px, ${y - dnd.offY}px, 0) scale(${CLONE_SCALE})`;
 }
 
 // ---------- live preview ----------
@@ -256,21 +284,13 @@ function updateTarget(x, y) {
     setPreview(dnd.L0, null);
     return;
   }
-  let page;
-  let index;
-  if (state.page >= dnd.preview.length) {
-    // The dashed "+ 新页" page at the end: a drop starts a new last page.
-    page = dnd.L0.length;
-    index = 0;
-  } else {
-    page = mapPage(state.page);
-    // Slots past the page's items are empty: the item lands at the end
-    // of the page — index = len(L0 page without the dragged id).
-    const len = page < dnd.L0.length
-      ? dnd.L0[page].length - (page === dnd.srcPage ? 1 : 0)
-      : 0;
-    index = Math.min(cellIndexAt(pageEl, x, y), len);
-  }
+  const page = mapPage(state.page);
+  // Slots past the page's items are empty: the item lands at the end
+  // of the page — index = len(L0 page without the dragged id).
+  const len = page < dnd.L0.length
+    ? dnd.L0[page].length - (page === dnd.srcPage ? 1 : 0)
+    : 0;
+  const index = Math.min(cellIndexAt(pageEl, x, y), len);
   setPreview(insert(dnd.L0, dnd.id, page, index, pageSize()), { page, index });
 }
 
@@ -366,7 +386,14 @@ function setEdgeHint(dir) {
 }
 
 function updateEdge(x, y) {
-  setEdge(edgeDirAt(x, y));
+  let dir = edgeDirAt(x, y);
+  // Suppress the flip a bound makes impossible — no flip left from the
+  // first page, none right past the last existing (preview) page — so
+  // the edge hint and the dwell timer stay off instead of teasing a
+  // flip that would only clamp.
+  if (dir < 0 && state.page <= 0) dir = 0;
+  if (dir > 0 && state.page >= dnd.preview.length - 1) dir = 0;
+  setEdge(dir);
 }
 
 // setEdge applies a resolved edge direction: entering a zone arms the
@@ -383,7 +410,7 @@ function setEdge(dir) {
 function edgeFlip(dir) {
   if (!dnd || dnd.edgeDir !== dir) return;
   const before = state.page;
-  goToPage(before + dir); // clamps at both ends, incl. the "+ 新页" page
+  goToPage(before + dir); // clamps at both ends — the last existing page
   // At the bound nothing flips; the timer stays disarmed until the
   // pointer leaves and re-enters the zone (edgeDir keeps the direction).
   if (state.page === before) return;
@@ -397,6 +424,7 @@ function edgeFlip(dir) {
 
 function cleanup() {
   clearTimeout(dnd.edgeTimer);
+  if (dnd.raf) cancelAnimationFrame(dnd.raf);
   dnd.clone?.remove();
   dnd = null;
   lastUp = null; // next drag must not score a stale release point
@@ -412,9 +440,4 @@ registerTileDnd({
   // The layout app.js renders in place of the committed pages while a
   // drag runs (arrays of ids per page), or null when idle.
   previewPages: () => (dnd ? dnd.preview : null),
-  // The dashed "+ 新页" page (a "start a new page" drop target) stays
-  // available while the preview hasn't already grown past the committed
-  // layout — once it has, the new page is real and needs no twin.
-  wantsExtraPage: () =>
-    dnd !== null && dnd.preview.length <= dnd.L0.length,
 });

@@ -10,13 +10,10 @@
 // keeps a dashed accent mark, and update() re-renders on every preview
 // change, so the strip always tracks it.
 //
-// Page count mirrors the displayed pages: one thumbnail per preview page
-// plus — under the same condition dnd.js wantsExtraPage() appends its
-// dashed drop page (the preview hasn't grown past the committed layout)
-// — a final "+ 新页" thumbnail. With independent pages a new page is
-// always a meaningful destination: dwelling on the thumb flips the view
-// to the grid's dashed drop page, where a release creates a fresh last
-// page rather than landing on an existing one.
+// Page count mirrors the displayed pages exactly: one thumbnail per
+// page the grid renders. There is no virtual "new page" target — new
+// pages are only created by the overflow cascade, the + button, or a
+// grid shrink, never by this strip or a drop at its end.
 //
 // Behaviour: parking the pointer ~400ms on a thumbnail flips the main
 // view to that page (one shot per entry) so the drag can continue into
@@ -26,10 +23,8 @@
 // committed layout (the same thing a cancel restores), and a release
 // over a thumbnail — resolved by dnd.js through dropPage() — CANCELS
 // the drag exactly like a release outside the grid: nothing moves and
-// nothing is sent to the server. The "+ 新页" thumb works the same way:
-// dwell flips to the new-page view, release on it cancels. Thumbs
-// report DISPLAYED page indices; dnd.js translates them into layout
-// indices.
+// nothing is sent to the server. Thumbs report DISPLAYED page indices;
+// dnd.js translates them into layout indices.
 // hide() fades the strip out and clears every timer and the resize hook
 // — the strip itself is hit-tested geometrically through
 // document.elementsFromPoint and has no DOM listeners of its own, so
@@ -45,7 +40,6 @@
 // even if that ever regresses.
 
 import { state, pageSize, goToPage, displayPages } from './app.js';
-import { toLayout } from './layout.js';
 
 const HOVER_FLIP_MS = 400; // dwell on a thumbnail before goToPage
 const REMOVE_MS = 240;     // detach after the ~180ms fade (+slack)
@@ -130,13 +124,8 @@ export function hide() {
 export function update() {
   if (!shown || !strip || !strip.isConnected) return;
   const pages = displayPages();
-  // Same condition as dnd.js wantsExtraPage(): the "+ 新页" drop target
-  // exists while the preview hasn't already grown past the committed
-  // layout — once it has, that new page is real and needs no twin.
-  const wantNew = pages.length <= toLayout(state.bookmarks).length;
-  const total = pages.length + (wantNew ? 1 : 0);
   const nodes = [];
-  for (let p = 0; p < total; p++) nodes.push(makeThumb(p, p >= pages.length, pages));
+  for (let p = 0; p < pages.length; p++) nodes.push(makeThumb(p, pages));
   // Rebuilding the children resets scrollLeft — keep it so a live preview
   // doesn't snap a scrolled strip back to the start.
   const sl = strip.scrollLeft;
@@ -144,16 +133,15 @@ export function update() {
   strip.scrollLeft = sl;
 }
 
-function makeThumb(p, isNew, pages) {
+function makeThumb(p, pages) {
   const size = pageSize();
   const t = document.createElement('div');
   t.className = 'thumb';
-  // The thumb's DISPLAYED page index — for "+ 新页" that's one past the
-  // last preview page. dnd.js maps it to a layout page for the move.
+  // The thumb's DISPLAYED page index; dnd.js maps it to a layout page
+  // for the move.
   t.dataset.page = String(p);
   t.setAttribute('role', 'option');
-  t.setAttribute('aria-label', isNew ? '新页' : `第 ${p + 1} 页`);
-  if (isNew) t.classList.add('thumb--new');
+  t.setAttribute('aria-label', `第 ${p + 1} 页`);
   if (p === state.page) {
     t.classList.add('thumb--current');
     t.setAttribute('aria-selected', 'true');
@@ -164,18 +152,8 @@ function makeThumb(p, isNew, pages) {
   // --t-rows/--t-cols feed the repeat()s in thumbs.css, like .page does.
   g.style.setProperty('--t-rows', state.grid.rows);
   g.style.setProperty('--t-cols', state.grid.cols);
-  if (isNew) {
-    // Empty dashed cells under a centered "+" — a visual echo of the
-    // dashed drop-slot the extra grid page itself renders.
-    for (let i = 0; i < size; i++) g.append(makeCell(null));
-    const plus = document.createElement('span');
-    plus.className = 'thumb-plus';
-    plus.textContent = '+';
-    g.append(plus);
-  } else {
-    const items = pages[p] || [];
-    for (let i = 0; i < size; i++) g.append(makeCell(items[i]));
-  }
+  const items = pages[p] || [];
+  for (let i = 0; i < size; i++) g.append(makeCell(items[i]));
   t.append(g);
   return t;
 }

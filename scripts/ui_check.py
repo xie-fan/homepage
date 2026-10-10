@@ -284,4 +284,48 @@ check('8h page that becomes empty is removed', len(lay())==1, [len(p) for p in l
 reset()
 check('layout restored after round-8 checks', lay()==L0)
 
+
+# ---------- round 8b: drag UX ----------
+reset()
+RIGHT = lambda: (cmd('Input.dispatchKeyEvent', type='rawKeyDown', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39), cmd('Input.dispatchKeyEvent', type='keyUp', key='ArrowRight', code='ArrowRight', windowsVirtualKeyCode=39))
+LEFT = lambda: (cmd('Input.dispatchKeyEvent', type='rawKeyDown', key='ArrowLeft', code='ArrowLeft', windowsVirtualKeyCode=37), cmd('Input.dispatchKeyEvent', type='keyUp', key='ArrowLeft', code='ArrowLeft', windowsVirtualKeyCode=37))
+dragging = lambda: ev("!!document.querySelector('.drag-clone')")
+# 1. drag started mid page-slide animation (several delays, both directions)
+res91 = []
+for dirn, delay in [('R',0.0),('R',0.05),('R',0.15),('L',0.03),('L',0.12)]:
+    cmd('Page.reload'); time.sleep(2)
+    if dirn=='L': RIGHT(); time.sleep(0.9)
+    (RIGHT if dirn=='R' else LEFT)(); time.sleep(delay)
+    x, y = G0[0], G0[1]
+    mouse('mouseMoved',x,y,0); mouse('mousePressed',x,y)
+    for k in range(1,8): mouse('mouseMoved',x+6*k,y+6*k); time.sleep(0.02)
+    time.sleep(0.25)
+    ok = dragging() and len(thumbs_xy() or [])>=2 and ev("!!document.querySelector('.tile-source,.placeholder,[data-placeholder],.dragging')")
+    res91.append((dirn, delay, bool(ok)))
+    key('Escape'); mouse('mouseReleased',x+42,y+42,0); time.sleep(0.6)
+check('9.1 drag starts mid slide animation (ghost + strip + placeholder)', all(r[2] for r in res91), res91)
+check('9.1 cancel leaves layout unchanged', lay()==L0)
+reset()
+# 2. edge flip stops at last page / no flip left from page 1
+a = tile_xy(0); press(a[0],a[1]); path(lerp((a[0]+15,a[1]+15),(5,a[1]),6)); time.sleep(1.8)
+check('9.2 no left flip from page 1', ev(page)==0, ev(page))
+path(lerp((5,a[1]),(1275,a[1]),8)); time.sleep(3.0)
+nth = len(thumbs_xy() or [])
+check('9.2 right-edge hold stops at last existing page (no virtual page 3)', ev(page)==1 and nth==2, (ev(page), nth))
+release(1275,a[1])
+check('9.2 release at edge saves nothing', lay()==L0)
+reset()
+# 3. ghost follows pointer on fast motion (transform + rAF, no transition)
+a = tile_xy(0); press(a[0],a[1]); time.sleep(0.1)
+tr = ev("(()=>{const g=document.querySelector('.drag-clone');if(!g)return null;const cs=getComputedStyle(g);return [cs.transitionDuration,cs.transitionProperty]})()")
+check('9.3 ghost has no transition', tr is not None and all(float(d.strip().rstrip('s') or 0)==0 for d in tr[0].split(',')), tr)
+lags = []
+for (px,py) in [(900,300),(300,600),(1100,650),(640,690),(200,200)]:
+    mouse('mouseMoved',px,py)
+    d = ev(f"new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>{{const g=document.querySelector('.drag-clone').getBoundingClientRect();r([g.left<= {px} && {px} <= g.right && g.top <= {py} && {py} <= g.bottom, Math.round(g.left+g.width/2-{px}), Math.round(g.top+g.height/2-{py})])}})))")
+    lags.append(d)
+check('9.3 ghost under pointer within 2 frames after fast jumps', all(d and d[0] for d in lags), lags)
+key('Escape'); mouse('mouseReleased',200,200,0); time.sleep(0.8)
+check('9.3 cancel leaves layout unchanged', lay()==L0)
+reset()
 print(f"\n{sum(r for _,r in results)}/{len(results)} checks passed")

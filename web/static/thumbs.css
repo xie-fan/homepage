@@ -119,29 +119,6 @@
   background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
-/* The "+ 新页" target (only present while the last page is full): dashed
-   empty cells with a centered "+", mirroring the grid's .tile.drop-slot. */
-.thumb--new {
-  border-style: dashed;
-}
-
-.thumb--new .thumb-cell {
-  background: transparent;
-  border: 1px dashed color-mix(in srgb, var(--fg) 30%, transparent);
-}
-
-.thumb-plus {
-  grid-column: 1 / -1;
-  grid-row: 1 / -1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--muted);
-  font-size: 20px;
-  font-weight: 600;
-  line-height: 1;
-}
-
 /* Narrow screens: smaller thumbnails; the strip scrolls horizontally
    when the pages don't fit. */
 @media (max-width: 640px) {
