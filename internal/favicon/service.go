@@ -173,7 +173,10 @@ func (s *Service) enqueue(id int64, pageURL string, force bool) {
 // IconFile returns the cached icon file for b plus its content type, or
 // fs.ErrNotExist when nothing is cached. The stored name is reduced to
 // its basename before joining so a corrupt icon_path cannot escape the
-// icons dir.
+// icons dir. The file's leading bytes are re-validated before serving:
+// a poisoned cache entry (e.g. an HTML page once accepted under an
+// image label) is deleted, the bookmark flipped back to pending and a
+// fresh fetch enqueued — the caller then reports ErrNotExist.
 func (s *Service) IconFile(_ context.Context, b store.Bookmark) (string, string, error) {
 	if b.IconPath == "" {
 		return "", "", fs.ErrNotExist
@@ -182,7 +185,25 @@ func (s *Service) IconFile(_ context.Context, b store.Bookmark) (string, string,
 	if _, err := os.Stat(path); err != nil {
 		return "", "", err
 	}
-	return path, contentTypeForExt(filepath.Ext(b.IconPath)), nil
+	ct, ok := validateIconFile(path)
+	if !ok {
+		s.purgeIcon(b, path)
+		return "", "", fs.ErrNotExist
+	}
+	return path, ct, nil
+}
+
+// purgeIcon drops a cache file that failed byte validation, flips the
+// bookmark's icon back to pending and queues a fresh fetch so the
+// poisoned entry heals itself.
+func (s *Service) purgeIcon(b store.Bookmark, path string) {
+	s.logger.Info("discarding invalid cached icon",
+		"file", filepath.Base(path), "bookmark", b.ID)
+	if err := os.Remove(path); err != nil {
+		s.logger.Warn("remove invalid cached icon", "file", path, "err", err)
+	}
+	s.setIcon(b.ID, "", store.IconPending)
+	s.Enqueue(b.ID, b.URL)
 }
 
 // Close stops accepting work, cancels in-flight fetches and waits for
@@ -239,9 +260,13 @@ func (s *Service) process(id int64, job iconJob) {
 		return
 	}
 	if !job.force {
-		if name, ok := s.cachedIcon(host); ok {
+		if name, purged := s.cachedIcon(host); name != "" {
 			s.setIcon(id, name, store.IconOK)
 			return
+		} else if purged {
+			// The only cached file was poison (deleted by cachedIcon);
+			// flag the bookmark so it refetches below.
+			s.setIcon(id, "", store.IconPending)
 		}
 	}
 
@@ -260,7 +285,7 @@ func (s *Service) process(id int64, job iconJob) {
 	// flight registration.
 	var res fetchResult
 	if !job.force {
-		if name, ok := s.cachedIcon(host); ok {
+		if name, _ := s.cachedIcon(host); name != "" {
 			res = fetchResult{name: name, status: store.IconOK}
 		}
 	}
@@ -274,11 +299,14 @@ func (s *Service) process(id int64, job iconJob) {
 }
 
 // cachedIcon returns the host-keyed icon file already sitting in the
-// icons dir — any known extension, written less than iconReuseMaxAge
-// ago — or false, sending the caller to the network. Because the file
-// name is derived from the host alone, a bookmark orphaned by a delete
-// or replace still reuses it; no sibling bookmark is needed.
-func (s *Service) cachedIcon(host string) (string, bool) {
+// icons dir — a well-formed name, written less than iconReuseMaxAge
+// ago, and still decodable as an icon — or "", sending the caller to
+// the network. A file that fails the byte check is poison (e.g. an HTML
+// page stored under an image label): it is deleted and reported via
+// purged so the caller can flag the bookmark for the refetch. Because
+// the file name is derived from the host alone, a bookmark orphaned by
+// a delete or replace still reuses it; no sibling bookmark is needed.
+func (s *Service) cachedIcon(host string) (name string, purged bool) {
 	prefix := hostFilePrefix(host) + "."
 	matches, err := filepath.Glob(filepath.Join(s.dir, prefix+"*"))
 	if err != nil {
@@ -292,12 +320,23 @@ func (s *Service) cachedIcon(host string) (string, bool) {
 			continue
 		}
 		st, err := os.Stat(m)
-		if err != nil || st.IsDir() || time.Since(st.ModTime()) > iconReuseMaxAge {
+		if err != nil || st.IsDir() {
 			continue
 		}
-		return name, true
+		if _, ok := validateIconFile(m); !ok {
+			s.logger.Warn("deleting invalid cached icon", "file", name)
+			if err := os.Remove(m); err != nil {
+				s.logger.Warn("remove invalid cached icon", "file", name, "err", err)
+			}
+			purged = true
+			continue
+		}
+		if time.Since(st.ModTime()) > iconReuseMaxAge {
+			continue
+		}
+		return name, purged
 	}
-	return "", false
+	return "", purged
 }
 
 // flightFor registers on the flight for host, reporting whether the

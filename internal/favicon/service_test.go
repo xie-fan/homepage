@@ -3,8 +3,10 @@ package favicon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -420,6 +422,93 @@ func TestServiceStaleHostFileRefetches(t *testing.T) {
 	}
 	if b2.IconPath != b1.IconPath {
 		t.Fatalf("b2 icon = %q, want host-keyed %q", b2.IconPath, b1.IconPath)
+	}
+}
+
+// TestServiceInvalidCachedIconNotReused: a host-keyed cache file whose
+// bytes are not an icon (an HTML page once accepted under an image
+// label) is deleted instead of adopted, and the icon is refetched.
+func TestServiceInvalidCachedIconNotReused(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+	src := newCountingIconServer(t)
+
+	if err := env.svc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Plant the poisoned file before the first fetch for the host.
+	badName := iconFileName(src.srv.URL, "ico")
+	badPath := filepath.Join(env.iconDir, badName)
+	if err := os.WriteFile(badPath,
+		[]byte("<!DOCTYPE html><html>not an icon"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	b, err := env.st.Create(ctx, "t", src.srv.URL+"/a")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	env.svc.Enqueue(b.ID, b.URL)
+	b = waitStatus(t, env.st.BookmarkStore, b.ID, store.IconOK)
+
+	// The cache entry was rejected: a real fetch ran and stored the PNG
+	// under its own extension.
+	if got := src.pageHits.Load(); got != 1 {
+		t.Fatalf("page requests = %d, want 1 (invalid icon wrongly reused)", got)
+	}
+	if want := iconFileName(src.srv.URL, "png"); b.IconPath != want {
+		t.Fatalf("icon = %q, want refetched %q", b.IconPath, want)
+	}
+	if _, err := os.Stat(badPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("poisoned file still present: %v", err)
+	}
+}
+
+// TestServiceIconFileDropsCorrupt: serving a cache file that fails byte
+// validation reports it missing, deletes the file, flips the bookmark
+// back to pending and queues a refetch that heals it.
+func TestServiceIconFileDropsCorrupt(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+	if err := env.svc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	b, err := env.st.Create(ctx, "t", env.srv.URL)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Plant a poisoned host-keyed file and mark the bookmark ok, as if
+	// an older build had cached it.
+	name := iconFileName(env.srv.URL, "ico")
+	path := filepath.Join(env.iconDir, name)
+	if err := os.WriteFile(path, []byte("<!DOCTYPE html>"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := env.st.SetIcon(ctx, b.ID, name, store.IconOK); err != nil {
+		t.Fatalf("SetIcon: %v", err)
+	}
+	b, err = env.st.BookmarkStore.Get(ctx, b.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if _, _, err := env.svc.IconFile(ctx, b); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("IconFile err = %v, want fs.ErrNotExist", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("corrupt file still present: %v", err)
+	}
+
+	// The refetch queued by IconFile heals the bookmark with the real
+	// icon (a PNG under its own extension).
+	b = waitStatus(t, env.st.BookmarkStore, b.ID, store.IconOK)
+	if want := iconFileName(env.srv.URL, "png"); b.IconPath != want {
+		t.Fatalf("icon = %q, want refetched %q", b.IconPath, want)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("poisoned file restored: %v", err)
 	}
 }
 

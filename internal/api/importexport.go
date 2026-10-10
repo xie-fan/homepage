@@ -31,8 +31,16 @@ type exportDoc struct {
 // importDoc is the object form accepted by POST /api/import; version and
 // exported_at are ignored on the way in.
 type importDoc struct {
-	Settings  *store.Settings     `json:"settings"`
+	Settings  *importSettings     `json:"settings"`
 	Bookmarks []store.NewBookmark `json:"bookmarks"`
+}
+
+// importSettings mirrors the settings object an export carries. Spacing
+// is a pointer so an absent key (e.g. an older export) is distinguished
+// from a present-but-invalid one — only the latter rejects the import.
+type importSettings struct {
+	Grid    store.Grid `json:"grid"`
+	Spacing *string    `json:"spacing"`
 }
 
 // exportBookmarks downloads all bookmarks plus settings as an attachment.
@@ -115,7 +123,26 @@ func (s *server) importBookmarks(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, badInput(codeInvalidGrid, "grid", fmt.Sprintf("settings: %s", err)))
 			return
 		}
-		if err := s.store.SettingsStore.Put(ctx, *settings); err != nil {
+		if settings.Spacing != nil {
+			if err := store.ValidateSpacing(*settings.Spacing); err != nil {
+				writeErr(w, badInput(codeInvalidSpacing, "spacing",
+					fmt.Sprintf("settings: %s", err)))
+				return
+			}
+		}
+		// Applied over the current settings so an absent spacing keeps
+		// its value; anything invalid was rejected above, before any
+		// bookmark is deleted.
+		st, err := s.store.SettingsStore.Get(ctx)
+		if err != nil {
+			s.handleErr(w, r, err)
+			return
+		}
+		st.Grid = settings.Grid
+		if settings.Spacing != nil {
+			st.Spacing = *settings.Spacing
+		}
+		if err := s.store.SettingsStore.Put(ctx, st); err != nil {
 			s.handleErr(w, r, err)
 			return
 		}
@@ -167,7 +194,7 @@ func (s *server) dropDuplicateItems(ctx context.Context, items []store.NewBookma
 // a bare [ {title,url}, ... ] array. Returns the bookmark items and the
 // optional embedded settings (nil when absent or when importing an
 // array), or an *apiError describing the bad payload.
-func decodeImportBody(w http.ResponseWriter, r *http.Request) ([]store.NewBookmark, *store.Settings, *apiError) {
+func decodeImportBody(w http.ResponseWriter, r *http.Request) ([]store.NewBookmark, *importSettings, *apiError) {
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxImportBody))
 	if err != nil {
 		var tooBig *http.MaxBytesError

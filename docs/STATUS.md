@@ -1,3 +1,3 @@
 # Status
 
-QA round 2 polish done (items 1-9). See git log.
+Round 4 (spacing setting, looser layout, invalid icon rejection) committed.

@@ -196,11 +196,11 @@ func (f *Fetcher) pageCandidates(ctx context.Context, u *url.URL) ([]Candidate, 
 // tryCandidate fetches one parsed candidate; data: URIs decode locally.
 func (f *Fetcher) tryCandidate(ctx context.Context, c Candidate) ([]byte, string, bool) {
 	if strings.HasPrefix(c.URL, "data:") {
-		data, ct, err := decodeDataURI(c.URL)
+		data, err := decodeDataURI(c.URL)
 		if err != nil {
 			return nil, "", false
 		}
-		if nct, ok := acceptIcon(data, ct); ok {
+		if nct, ok := acceptIcon(data); ok {
 			return data, nct, true
 		}
 		return nil, "", false
@@ -209,7 +209,7 @@ func (f *Fetcher) tryCandidate(ctx context.Context, c Candidate) ([]byte, string
 }
 
 // getIcon GETs one icon URL and validates the response: 2xx, ≤ 512 KiB,
-// non-empty, image content type.
+// non-empty, body bytes matching a known icon format.
 func (f *Fetcher) getIcon(ctx context.Context, rawURL string) ([]byte, string, bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -230,7 +230,7 @@ func (f *Fetcher) getIcon(ctx context.Context, rawURL string) ([]byte, string, b
 	if err != nil || len(data) > maxIconBytes {
 		return nil, "", false
 	}
-	if ct, ok := acceptIcon(data, resp.Header.Get("Content-Type")); ok {
+	if ct, ok := acceptIcon(data); ok {
 		return data, ct, true
 	}
 	return nil, "", false
@@ -259,45 +259,21 @@ func (f *Fetcher) setHeaders(req *http.Request, accept string) {
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 }
 
-// acceptIcon validates a downloaded body as an icon and returns the
-// content type to store for it. The declared type wins when it is an
-// image. A declared (or sniffed) HTML type is rejected outright — a
-// page is never an icon, and checking before the SVG probe keeps
-// markup with an early inline "<svg" (e.g. an SPA shell served for
-// /favicon.ico) from being adopted. Generic types
-// (application/octet-stream, binary/octet-stream, missing) fall
-// through to byte sniffing; SVG sniffs as text, so a literal "<svg" in
-// the first KiB is accepted as image/svg+xml last.
-func acceptIcon(data []byte, headerCT string) (string, bool) {
-	if len(data) == 0 {
-		return "", false
-	}
-	declared := mediaType(headerCT)
-	if strings.HasPrefix(declared, "image/") {
-		return declared, true
-	}
-	if isHTMLMediaType(declared) {
-		return "", false
-	}
+// acceptIcon validates a body as an icon and returns the content type
+// matching the detected format. Only the bytes decide — a declared
+// Content-Type is deliberately ignored because servers too often label
+// an HTML error page as image/*: magic bytes of ICO/CUR, PNG, GIF,
+// JPEG, WebP and BMP are recognized, and an SVG document is detected by
+// a "<svg" tag near the start. Anything else — including HTML, whose
+// inline "<svg" must not qualify — is not an icon.
+func acceptIcon(data []byte) (string, bool) {
 	if ct, ok := sniffImageType(data); ok {
 		return ct, true
-	}
-	sniffed := mediaType(http.DetectContentType(data))
-	if strings.HasPrefix(sniffed, "image/") {
-		return sniffed, true
-	}
-	if isHTMLMediaType(sniffed) {
-		return "", false
 	}
 	if looksLikeSVG(data) {
 		return "image/svg+xml", true
 	}
 	return "", false
-}
-
-// isHTMLMediaType reports whether mt marks an (X)HTML document.
-func isHTMLMediaType(mt string) bool {
-	return mt == "text/html" || mt == "application/xhtml+xml"
 }
 
 // sniffImageType recognizes icon encodings by magic bytes. It exists
@@ -307,7 +283,8 @@ func isHTMLMediaType(mt string) bool {
 func sniffImageType(data []byte) (string, bool) {
 	switch {
 	case len(data) >= 4 && data[0] == 0x00 && data[1] == 0x00 &&
-		data[2] == 0x01 && data[3] == 0x00:
+		(data[2] == 0x01 || data[2] == 0x02) && data[3] == 0x00:
+		// 00 00 01 00 = ICO, 00 00 02 00 = CUR; same container family.
 		return "image/x-icon", true
 	case bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")):
 		return "image/png", true
@@ -318,6 +295,8 @@ func sniffImageType(data []byte) (string, bool) {
 	case len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) &&
 		bytes.Equal(data[8:12], []byte("WEBP")):
 		return "image/webp", true
+	case bytes.HasPrefix(data, []byte("BM")):
+		return "image/bmp", true
 	}
 	return "", false
 }
@@ -337,36 +316,68 @@ func mediaTypeOf(h http.Header) string {
 	return mediaType(h.Get("Content-Type"))
 }
 
-// looksLikeSVG reports whether data plausibly starts an SVG document.
+// looksLikeSVG reports whether data is an SVG document: after leading
+// whitespace plus an optional "<?xml ...?>" prolog and "<!-- -->"
+// comments, an "<svg" tag must appear within the first KiB of the rest.
+// A document starting "<!DOCTYPE html" or "<html" is a page that may
+// merely contain an inline SVG — never an icon.
 func looksLikeSVG(data []byte) bool {
-	head := data
-	if len(head) > 1024 {
-		head = head[:1024]
+	t := bytes.TrimSpace(data)
+	for {
+		if hasFoldPrefix(t, "<!doctype html") || hasFoldPrefix(t, "<html") {
+			return false
+		}
+		if rest, ok := bytes.CutPrefix(t, []byte("<?")); ok {
+			i := bytes.Index(rest, []byte("?>"))
+			if i < 0 {
+				return false // unterminated processing instruction
+			}
+			t = bytes.TrimSpace(rest[i+2:])
+			continue
+		}
+		if rest, ok := bytes.CutPrefix(t, []byte("<!--")); ok {
+			i := bytes.Index(rest, []byte("-->"))
+			if i < 0 {
+				return false // unterminated comment
+			}
+			t = bytes.TrimSpace(rest[i+3:])
+			continue
+		}
+		break
 	}
-	return bytes.Contains(head, []byte("<svg"))
+	if len(t) > 1024 {
+		t = t[:1024]
+	}
+	return bytes.Contains(t, []byte("<svg"))
+}
+
+// hasFoldPrefix reports whether b starts with prefix, ASCII
+// case-insensitively (markup prologs vary in case).
+func hasFoldPrefix(b []byte, prefix string) bool {
+	return len(b) >= len(prefix) && bytes.EqualFold(b[:len(prefix)], []byte(prefix))
 }
 
 // decodeDataURI decodes "data:[<mediatype>][;base64],<payload>" under
-// the icon size cap. Percent-encoded payloads and both padded and raw
-// base64 are supported.
-func decodeDataURI(uri string) (data []byte, mediaType string, err error) {
+// the icon size cap. The declared mediatype is ignored — acceptIcon
+// checks the decoded bytes instead. Percent-encoded payloads and both
+// padded and raw base64 are supported.
+func decodeDataURI(uri string) (data []byte, err error) {
 	rest, ok := strings.CutPrefix(uri, "data:")
 	if !ok {
-		return nil, "", errors.New("favicon: not a data URI")
+		return nil, errors.New("favicon: not a data URI")
 	}
 	meta, payload, found := strings.Cut(rest, ",")
 	if !found {
-		return nil, "", errors.New("favicon: malformed data URI")
+		return nil, errors.New("favicon: malformed data URI")
 	}
 	// A payload can't decode smaller than 3/4 of its base64 length, so
 	// reject early when it is already over the cap.
 	if len(payload) > maxIconBytes*2 {
-		return nil, "", errors.New("favicon: data URI too large")
+		return nil, errors.New("favicon: data URI too large")
 	}
 
 	parts := strings.Split(meta, ";")
 	if strings.Contains(parts[0], "/") {
-		mediaType = strings.ToLower(parts[0])
 		parts = parts[1:]
 	}
 	isB64 := false
@@ -387,10 +398,10 @@ func decodeDataURI(uri string) (data []byte, mediaType string, err error) {
 		data = []byte(decoded)
 	}
 	if err != nil {
-		return nil, "", fmt.Errorf("favicon: data URI decode: %w", err)
+		return nil, fmt.Errorf("favicon: data URI decode: %w", err)
 	}
 	if len(data) == 0 || len(data) > maxIconBytes {
-		return nil, "", errors.New("favicon: data URI payload out of size limits")
+		return nil, errors.New("favicon: data URI payload out of size limits")
 	}
-	return data, mediaType, nil
+	return data, nil
 }

@@ -3,6 +3,8 @@ package favicon
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -52,6 +54,8 @@ func extForContentType(ct string) string {
 		return "gif"
 	case "image/webp":
 		return "webp"
+	case "image/bmp":
+		return "bmp"
 	}
 	if sub, ok := strings.CutPrefix(mediaType(ct), "image/"); ok && isNameChar(sub) {
 		return sub
@@ -59,25 +63,26 @@ func extForContentType(ct string) string {
 	return "ico"
 }
 
-// contentTypeForExt maps a cached icon's file extension back to a
-// content type; unknown extensions return "" so ServeFile can sniff.
-func contentTypeForExt(ext string) string {
-	switch strings.ToLower(ext) {
-	case ".ico":
-		return "image/x-icon"
-	case ".png":
-		return "image/png"
-	case ".svg":
-		return "image/svg+xml"
-	case ".jpg", ".jpeg":
-		return "image/jpeg"
-	case ".gif":
-		return "image/gif"
-	case ".webp":
-		return "image/webp"
-	default:
-		return ""
+// iconHeadBytes is how much of a cached icon file is read to validate
+// its format: the magic signatures need a dozen bytes and the SVG probe
+// a KiB past any prolog/comments, so a few KiB of head is ample.
+const iconHeadBytes = 8 << 10
+
+// validateIconFile reads the leading bytes of the cached icon at path
+// and reports its detected content type — the on-disk counterpart of
+// acceptIcon. A file that fails validation is not an icon.
+func validateIconFile(path string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
 	}
+	defer f.Close()
+	head := make([]byte, iconHeadBytes)
+	n, err := io.ReadFull(f, head)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return "", false
+	}
+	return acceptIcon(head[:n])
 }
 
 // isNameChar reports whether s is a safe file-extension body.

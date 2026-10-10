@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"homepage/internal/db"
+	"homepage/internal/favicon"
 	"homepage/internal/store"
 )
 
@@ -415,8 +416,11 @@ func TestSettings(t *testing.T) {
 	if st.Grid != store.DefaultGrid {
 		t.Fatalf("default grid = %+v, want %+v", st.Grid, store.DefaultGrid)
 	}
+	if st.Spacing != store.DefaultSpacing {
+		t.Fatalf("default spacing = %q, want %q", st.Spacing, store.DefaultSpacing)
+	}
 
-	want := store.Settings{Grid: store.Grid{Rows: 3, Cols: 5}}
+	want := store.Settings{Grid: store.Grid{Rows: 3, Cols: 5}, Spacing: store.SpacingRelaxed}
 	if code := reqJSON(t, srv, http.MethodPut, "/api/settings", want, &st); code != http.StatusOK {
 		t.Fatalf("put = %d, want 200", code)
 	}
@@ -425,18 +429,24 @@ func TestSettings(t *testing.T) {
 		t.Fatalf("settings = %+v, want %+v", st, want)
 	}
 
-	for name, body := range map[string]any{
-		"rows too small": store.Settings{Grid: store.Grid{Rows: 2, Cols: 5}},
-		"rows too big":   store.Settings{Grid: store.Grid{Rows: 6, Cols: 5}},
-		"cols too big":   store.Settings{Grid: store.Grid{Rows: 4, Cols: 7}},
-		"zero grid":      store.Settings{},
+	for _, tc := range []struct {
+		name             string
+		body             any
+		wantCode, wantIn string
+	}{
+		{"rows too small", store.Settings{Grid: store.Grid{Rows: 2, Cols: 5}, Spacing: store.SpacingNormal}, codeInvalidGrid, "grid"},
+		{"rows too big", store.Settings{Grid: store.Grid{Rows: 6, Cols: 5}, Spacing: store.SpacingNormal}, codeInvalidGrid, "grid"},
+		{"cols too big", store.Settings{Grid: store.Grid{Rows: 4, Cols: 7}, Spacing: store.SpacingNormal}, codeInvalidGrid, "grid"},
+		{"zero grid", store.Settings{Spacing: store.SpacingNormal}, codeInvalidGrid, "grid"},
+		{"bad spacing", store.Settings{Grid: store.DefaultGrid, Spacing: "cavernous"}, codeInvalidSpacing, "spacing"},
+		{"empty spacing", map[string]string{"spacing": ""}, codeInvalidSpacing, "spacing"},
 	} {
 		var out errBody
-		if code := reqJSON(t, srv, http.MethodPut, "/api/settings", body, &out); code != http.StatusBadRequest {
-			t.Errorf("%s: %d, want 400", name, code)
+		if code := reqJSON(t, srv, http.MethodPut, "/api/settings", tc.body, &out); code != http.StatusBadRequest {
+			t.Errorf("%s: %d, want 400", tc.name, code)
 		}
-		if out.Code != codeInvalidGrid || out.Field != "grid" {
-			t.Errorf("%s: body = %+v, want code %q field \"grid\"", name, out, codeInvalidGrid)
+		if out.Code != tc.wantCode || out.Field != tc.wantIn {
+			t.Errorf("%s: body = %+v, want code %q field %q", tc.name, out, tc.wantCode, tc.wantIn)
 		}
 	}
 	// Malformed JSON is also a 400; stored settings survive all of it.
@@ -453,12 +463,47 @@ func TestSettings(t *testing.T) {
 	}
 }
 
+// TestSettingsPartialPut: PUT /api/settings takes partial updates — a
+// key that is omitted keeps its current value.
+func TestSettingsPartialPut(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+
+	var st store.Settings
+	// Spacing only: the grid keeps its current (default) value.
+	if code := reqRaw(t, srv, http.MethodPut, "/api/settings",
+		`{"spacing":"compact"}`, &st); code != http.StatusOK {
+		t.Fatalf("spacing-only put = %d, want 200", code)
+	}
+	if st.Spacing != store.SpacingCompact || st.Grid != store.DefaultGrid {
+		t.Fatalf("after spacing-only put = %+v", st)
+	}
+
+	// Grid only: the spacing keeps the stored "compact".
+	if code := reqRaw(t, srv, http.MethodPut, "/api/settings",
+		`{"grid":{"rows":5,"cols":4}}`, &st); code != http.StatusOK {
+		t.Fatalf("grid-only put = %d, want 200", code)
+	}
+	want := store.Settings{Grid: store.Grid{Rows: 5, Cols: 4}, Spacing: store.SpacingCompact}
+	if st != want {
+		t.Fatalf("after grid-only put = %+v, want %+v", st, want)
+	}
+
+	// An empty object is a valid no-op.
+	if code := reqRaw(t, srv, http.MethodPut, "/api/settings", `{}`, &st); code != http.StatusOK {
+		t.Fatalf("empty put = %d, want 200", code)
+	}
+	reqJSON(t, srv, http.MethodGet, "/api/settings", nil, &st)
+	if st != want {
+		t.Fatalf("settings = %+v, want %+v", st, want)
+	}
+}
+
 func TestExportImportRoundtrip(t *testing.T) {
 	srv1, _, _ := newTestServer(t)
 	postBookmark(t, srv1, "a", "https://a.example.com")
 	postBookmark(t, srv1, "b", "https://b.example.com")
-	grid := store.Settings{Grid: store.Grid{Rows: 3, Cols: 5}}
-	reqJSON(t, srv1, http.MethodPut, "/api/settings", grid, nil)
+	want := store.Settings{Grid: store.Grid{Rows: 3, Cols: 5}, Spacing: store.SpacingCompact}
+	reqJSON(t, srv1, http.MethodPut, "/api/settings", want, nil)
 
 	resp := do(t, srv1, http.MethodGet, "/api/export", nil)
 	if resp.StatusCode != http.StatusOK {
@@ -480,7 +525,7 @@ func TestExportImportRoundtrip(t *testing.T) {
 		t.Fatalf("export json: %v", err)
 	}
 	if doc.Version != exportVersion || doc.ExportedAt == "" ||
-		len(doc.Bookmarks) != 2 || doc.Settings != grid {
+		len(doc.Bookmarks) != 2 || doc.Settings != want {
 		t.Fatalf("export doc = %s", raw)
 	}
 
@@ -496,8 +541,8 @@ func TestExportImportRoundtrip(t *testing.T) {
 	}
 	var st store.Settings
 	reqJSON(t, srv2, http.MethodGet, "/api/settings", nil, &st)
-	if st != grid {
-		t.Fatalf("imported settings = %+v, want %+v", st, grid)
+	if st != want {
+		t.Fatalf("imported settings = %+v, want %+v", st, want)
 	}
 	// Each imported bookmark got an icon fetch queued.
 	if got := icons2.calls(); len(got) != 2 {
@@ -507,7 +552,7 @@ func TestExportImportRoundtrip(t *testing.T) {
 	// Append (the default mode) adds without wiping, ignores settings
 	// embedded in the payload, and skips items already bookmarked —
 	// here the two repeats, while the new entry imports.
-	doc.Settings = store.Settings{Grid: store.Grid{Rows: 5, Cols: 6}}
+	doc.Settings = store.Settings{Grid: store.Grid{Rows: 5, Cols: 6}, Spacing: store.SpacingRelaxed}
 	doc.Bookmarks = append(doc.Bookmarks,
 		store.NewBookmark{Title: "c", URL: "https://c.example.com"})
 	raw2, err := json.Marshal(doc)
@@ -522,8 +567,8 @@ func TestExportImportRoundtrip(t *testing.T) {
 		t.Fatalf("after append = %v", got)
 	}
 	reqJSON(t, srv2, http.MethodGet, "/api/settings", nil, &st)
-	if st != grid {
-		t.Fatalf("append changed settings = %+v, want %+v", st, grid)
+	if st != want {
+		t.Fatalf("append changed settings = %+v, want %+v", st, want)
 	}
 }
 
@@ -605,7 +650,7 @@ func TestImportValidation(t *testing.T) {
 func TestImportReplaceInvalidSettings(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	postBookmark(t, srv, "keep", "https://keep.example.com")
-	grid := store.Settings{Grid: store.Grid{Rows: 3, Cols: 5}}
+	grid := store.Settings{Grid: store.Grid{Rows: 3, Cols: 5}, Spacing: store.SpacingNormal}
 	reqJSON(t, srv, http.MethodPut, "/api/settings", grid, nil)
 
 	body := `{"settings":{"grid":{"rows":99,"cols":5}},"bookmarks":[{"url":"https://x.example.com"}]}`
@@ -624,6 +669,52 @@ func TestImportReplaceInvalidSettings(t *testing.T) {
 	reqJSON(t, srv, http.MethodGet, "/api/settings", nil, &st)
 	if st != grid {
 		t.Fatalf("settings = %+v, want %+v", st, grid)
+	}
+}
+
+// TestImportReplaceInvalidSpacing: an invalid settings.spacing rejects
+// a replace import with invalid_spacing before any bookmark is deleted.
+func TestImportReplaceInvalidSpacing(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	postBookmark(t, srv, "keep", "https://keep.example.com")
+	want := store.Settings{Grid: store.Grid{Rows: 3, Cols: 5}, Spacing: store.SpacingRelaxed}
+	reqJSON(t, srv, http.MethodPut, "/api/settings", want, nil)
+
+	body := `{"settings":{"grid":{"rows":4,"cols":5},"spacing":"roomy"},"bookmarks":[{"url":"https://x.example.com"}]}`
+	var out errBody
+	if code := reqRaw(t, srv, http.MethodPost, "/api/import?mode=replace", body, &out); code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", code)
+	}
+	if out.Code != codeInvalidSpacing || out.Field != "spacing" {
+		t.Fatalf("body = %+v, want code %q field \"spacing\"", out, codeInvalidSpacing)
+	}
+	if got := listTitles(t, srv); !slices.Equal(got, []string{"keep"}) {
+		t.Fatalf("list = %v", got)
+	}
+	var st store.Settings
+	reqJSON(t, srv, http.MethodGet, "/api/settings", nil, &st)
+	if st != want {
+		t.Fatalf("settings = %+v, want %+v", st, want)
+	}
+}
+
+// TestImportReplaceSpacingOmitted: an older export without settings.spacing
+// imports fine — the current spacing is kept.
+func TestImportReplaceSpacingOmitted(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	want := store.Settings{Grid: store.Grid{Rows: 3, Cols: 4}, Spacing: store.SpacingRelaxed}
+	reqJSON(t, srv, http.MethodPut, "/api/settings", want, nil)
+
+	body := `{"settings":{"grid":{"rows":5,"cols":6}},"bookmarks":[{"url":"https://x.example.com"}]}`
+	var res map[string]int
+	if code := reqRaw(t, srv, http.MethodPost, "/api/import?mode=replace", body, &res); code != http.StatusOK {
+		t.Fatalf("import = %d, want 200", code)
+	}
+	var st store.Settings
+	reqJSON(t, srv, http.MethodGet, "/api/settings", nil, &st)
+	want.Grid = store.Grid{Rows: 5, Cols: 6}
+	if st != want {
+		t.Fatalf("settings = %+v, want %+v (spacing kept)", st, want)
 	}
 }
 
@@ -672,6 +763,88 @@ func TestGetIcon(t *testing.T) {
 	icons.setResult("", "", fs.ErrNotExist)
 	if code := reqJSON(t, srv, http.MethodGet, iconURL, nil, nil); code != http.StatusNotFound {
 		t.Fatalf("missing file = %d, want 404", code)
+	}
+}
+
+// TestGetIconCorruptFile wires the real favicon service: a cached icon
+// file whose bytes are not an icon (an HTML page once stored under an
+// image label) is not served — it is deleted, the bookmark flips back
+// to pending for a refetch, and GET answers 404 so the UI shows the
+// letter avatar.
+func TestGetIconCorruptFile(t *testing.T) {
+	dir := t.TempDir()
+	sqlDB, err := db.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	if err := db.Migrate(context.Background(), sqlDB); err != nil {
+		t.Fatalf("db.Migrate: %v", err)
+	}
+	st := store.NewSQLite(sqlDB)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	icons, err := favicon.NewService(st.BookmarkStore,
+		favicon.New(favicon.Options{AllowPrivate: true}), dir, logger)
+	if err != nil {
+		t.Fatalf("favicon.NewService: %v", err)
+	}
+	srv := httptest.NewServer(NewServer(Deps{Store: st, Icons: icons, Logger: logger}))
+	t.Cleanup(func() {
+		srv.Close()
+		icons.Close()
+		sqlDB.Close()
+	})
+	// The service is not started: enqueued refetches just queue, so the
+	// pending state below is stable.
+
+	ctx := context.Background()
+	b, err := st.Create(ctx, "a", "https://a.example.com")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	iconURL := fmt.Sprintf("/api/icons/%d", b.ID)
+
+	// A real PNG served through the same validation path → 200.
+	iconDir := filepath.Join(dir, "icons")
+	good := filepath.Join(iconDir, "good.png")
+	if err := os.WriteFile(good, append([]byte("\x89PNG\r\n\x1a\n"), 1, 2, 3), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetIcon(ctx, b.ID, "good.png", store.IconOK); err != nil {
+		t.Fatalf("SetIcon: %v", err)
+	}
+	resp := do(t, srv, http.MethodGet, iconURL, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("valid icon = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/png" {
+		t.Errorf("Content-Type = %q, want image/png", ct)
+	}
+	resp.Body.Close()
+
+	// An HTML page parked under an .ico name → 404 not_found.
+	bad := filepath.Join(iconDir, "poison.ico")
+	if err := os.WriteFile(bad, []byte("<!DOCTYPE html><html>not an icon"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetIcon(ctx, b.ID, "poison.ico", store.IconOK); err != nil {
+		t.Fatalf("SetIcon: %v", err)
+	}
+	var e errBody
+	if code := reqJSON(t, srv, http.MethodGet, iconURL, nil, &e); code != http.StatusNotFound {
+		t.Fatalf("corrupt icon = %d, want 404", code)
+	}
+	if e.Code != codeNotFound {
+		t.Fatalf("code = %q, want %q", e.Code, codeNotFound)
+	}
+	if _, err := os.Stat(bad); !os.IsNotExist(err) {
+		t.Fatalf("poisoned file still present: %v", err)
+	}
+	got, err := st.BookmarkStore.Get(ctx, b.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.IconStatus != store.IconPending || got.IconPath != "" {
+		t.Fatalf("icon = %q/%q, want ''/pending after purge", got.IconPath, got.IconStatus)
 	}
 }
 

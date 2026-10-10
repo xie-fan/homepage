@@ -290,31 +290,36 @@ func TestSettingsDefaults(t *testing.T) {
 	if s.Grid != DefaultGrid {
 		t.Errorf("grid = %+v, want default %+v", s.Grid, DefaultGrid)
 	}
+	if s.Spacing != DefaultSpacing {
+		t.Errorf("spacing = %q, want default %q", s.Spacing, DefaultSpacing)
+	}
 }
 
 func TestSettingsPutGet(t *testing.T) {
 	ctx, st := newTestStore(t)
-	if err := st.Put(ctx, Settings{Grid: Grid{Rows: 3, Cols: 5}}); err != nil {
+	want := Settings{Grid: Grid{Rows: 3, Cols: 5}, Spacing: SpacingCompact}
+	if err := st.Put(ctx, want); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	s, err := st.SettingsStore.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if s.Grid != (Grid{Rows: 3, Cols: 5}) {
-		t.Errorf("grid = %+v, want {3 5}", s.Grid)
+	if s != want {
+		t.Errorf("settings = %+v, want %+v", s, want)
 	}
 
 	// Overwrite an existing value.
-	if err := st.Put(ctx, Settings{Grid: Grid{Rows: 5, Cols: 4}}); err != nil {
+	want = Settings{Grid: Grid{Rows: 5, Cols: 4}, Spacing: SpacingRelaxed}
+	if err := st.Put(ctx, want); err != nil {
 		t.Fatalf("Put overwrite: %v", err)
 	}
 	s, err = st.SettingsStore.Get(ctx)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if s.Grid != (Grid{Rows: 5, Cols: 4}) {
-		t.Errorf("grid = %+v, want {5 4}", s.Grid)
+	if s != want {
+		t.Errorf("settings = %+v, want %+v", s, want)
 	}
 }
 
@@ -326,7 +331,7 @@ func TestSettingsPutInvalidGrid(t *testing.T) {
 		{Rows: 4, Cols: 3}, // cols too small
 		{Rows: 4, Cols: 7}, // cols too big
 	} {
-		if err := st.Put(ctx, Settings{Grid: g}); err == nil {
+		if err := st.Put(ctx, Settings{Grid: g, Spacing: SpacingNormal}); err == nil {
 			t.Errorf("Put(%+v): want error", g)
 		}
 	}
@@ -337,6 +342,52 @@ func TestSettingsPutInvalidGrid(t *testing.T) {
 	}
 	if s.Grid != DefaultGrid {
 		t.Errorf("grid = %+v after rejected Puts", s.Grid)
+	}
+}
+
+func TestSettingsPutInvalidSpacing(t *testing.T) {
+	ctx, st := newTestStore(t)
+	for _, sp := range []string{"", "wide", "NORMAL"} {
+		if err := st.Put(ctx, Settings{Grid: DefaultGrid, Spacing: sp}); err == nil {
+			t.Errorf("Put(spacing %q): want error", sp)
+		}
+	}
+	// Rejected Puts store nothing: still defaults.
+	s, err := st.SettingsStore.Get(ctx)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if s.Spacing != DefaultSpacing {
+		t.Errorf("spacing = %q after rejected Puts, want %q", s.Spacing, DefaultSpacing)
+	}
+}
+
+// TestSettingsInvalidStoredSpacing: a stored spacing that is not valid
+// JSON or not a known value yields the default instead of an error.
+func TestSettingsInvalidStoredSpacing(t *testing.T) {
+	ctx := context.Background()
+	sqlDB, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer sqlDB.Close()
+	if err := db.Migrate(ctx, sqlDB); err != nil {
+		t.Fatalf("db.Migrate: %v", err)
+	}
+	st := NewSQLite(sqlDB)
+
+	for _, raw := range []string{`"bogus"`, `123`, `{oops`} {
+		if _, err := sqlDB.ExecContext(ctx,
+			`INSERT OR REPLACE INTO settings (key, value) VALUES ('spacing', ?)`, raw); err != nil {
+			t.Fatalf("seed spacing %q: %v", raw, err)
+		}
+		s, err := st.SettingsStore.Get(ctx)
+		if err != nil {
+			t.Fatalf("Get with stored %q: %v", raw, err)
+		}
+		if s.Spacing != DefaultSpacing {
+			t.Errorf("stored %q → spacing %q, want %q", raw, s.Spacing, DefaultSpacing)
+		}
 	}
 }
 

@@ -71,9 +71,39 @@ func (g Grid) Validate() error {
 	return nil
 }
 
+// Spacing values for Settings.Spacing: the tile density presets.
+const (
+	SpacingCompact = "compact"
+	SpacingNormal  = "normal"
+	SpacingRelaxed = "relaxed"
+)
+
+// DefaultSpacing is used when no spacing setting is stored or the
+// stored value is invalid.
+const DefaultSpacing = SpacingNormal
+
+// ValidateSpacing reports whether s is a supported spacing value.
+func ValidateSpacing(s string) error {
+	switch s {
+	case SpacingCompact, SpacingNormal, SpacingRelaxed:
+		return nil
+	}
+	return fmt.Errorf("spacing %q: want %q, %q or %q",
+		s, SpacingCompact, SpacingNormal, SpacingRelaxed)
+}
+
 // Settings holds the user preferences persisted in the settings table.
 type Settings struct {
-	Grid Grid `json:"grid"`
+	Grid    Grid   `json:"grid"`
+	Spacing string `json:"spacing"`
+}
+
+// Validate checks every settings field.
+func (s Settings) Validate() error {
+	if err := s.Grid.Validate(); err != nil {
+		return err
+	}
+	return ValidateSpacing(s.Spacing)
 }
 
 // BookmarkStore is the persistence contract for bookmarks. Mutating

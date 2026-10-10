@@ -87,8 +87,60 @@ func TestMigrateFreshDB(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate versions: %v", err)
 	}
-	if !slices.Equal(versions, []int{1}) {
-		t.Errorf("schema_migrations versions = %v, want [1]", versions)
+	if !slices.Equal(versions, []int{1, 2}) {
+		t.Errorf("schema_migrations versions = %v, want [1 2]", versions)
+	}
+}
+
+// TestMigrateSpacingDefault: migration 0002 seeds settings 'spacing'
+// with the JSON string "normal"; the INSERT OR IGNORE keeps a value
+// the user already changed.
+func TestMigrateSpacingDefault(t *testing.T) {
+	ctx, path := openTest(t)
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	var val string
+	if err := db.QueryRowContext(ctx,
+		`SELECT value FROM settings WHERE key = 'spacing'`).Scan(&val); err != nil {
+		t.Fatalf("read spacing: %v", err)
+	}
+	if val != `"normal"` {
+		t.Errorf("spacing = %q, want %q", val, `"normal"`)
+	}
+
+	// Re-applying the migration must not clobber a customized value.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE settings SET value = '"relaxed"' WHERE key = 'spacing'`); err != nil {
+		t.Fatalf("customize spacing: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`DELETE FROM schema_migrations WHERE version = 2`); err != nil {
+		t.Fatalf("unrecord migration 2: %v", err)
+	}
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatalf("re-Migrate: %v", err)
+	}
+	if err := db.QueryRowContext(ctx,
+		`SELECT value FROM settings WHERE key = 'spacing'`).Scan(&val); err != nil {
+		t.Fatalf("read spacing: %v", err)
+	}
+	if val != `"relaxed"` {
+		t.Errorf("spacing = %q after re-migrate, want %q", val, `"relaxed"`)
+	}
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_migrations WHERE version = 2`).Scan(&n); err != nil {
+		t.Fatalf("count version 2: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("version 2 recorded %d times, want 1", n)
 	}
 }
 
@@ -103,7 +155,7 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := Migrate(ctx, db); err != nil {
 		t.Fatalf("first Migrate: %v", err)
 	}
-	// Second run must be a no-op: still exactly one applied version.
+	// Second run must be a no-op: still exactly two applied versions.
 	if err := Migrate(ctx, db); err != nil {
 		t.Fatalf("second Migrate: %v", err)
 	}
@@ -111,8 +163,8 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("schema_migrations rows = %d, want 1", n)
+	if n != 2 {
+		t.Errorf("schema_migrations rows = %d, want 2", n)
 	}
 	// Schema still usable after re-migration.
 	if _, err := db.ExecContext(ctx,

@@ -19,6 +19,7 @@ const (
 	codeInvalidID        = "invalid_id"
 	codeInvalidOrder     = "invalid_order"
 	codeInvalidGrid      = "invalid_grid"
+	codeInvalidSpacing   = "invalid_spacing"
 	codeImportInvalid    = "import_invalid"
 	codeImportTooLarge   = "import_too_large"
 	codeInvalidMode      = "invalid_mode"

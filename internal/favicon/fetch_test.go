@@ -118,6 +118,29 @@ func TestFetchNonImageRejected(t *testing.T) {
 	}
 }
 
+func TestFetchHTMLLabelledIconRejected(t *testing.T) {
+	// Regression for jd.com: the server answers /favicon.ico with an
+	// HTML page but labels it image/x-icon. Declared image/* types used
+	// to skip sniffing, so the page was cached as an icon; now the body
+	// bytes alone decide, and an HTML document never is one.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<head><link rel="icon" href="/i.ico"></head>`))
+	})
+	serveIcon(t, mux, "/i.ico", "image/x-icon",
+		[]byte("<!DOCTYPE html><html><body>not an icon</body></html>"))
+	serveIcon(t, mux, "/favicon.ico", "image/x-icon",
+		[]byte("<!DOCTYPE html><html><body>not an icon</body></html>"))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	_, _, err := newFetcher(Options{}).Fetch(context.Background(), srv.URL)
+	if !errors.Is(err, ErrNoIcon) {
+		t.Fatalf("err = %v, want ErrNoIcon", err)
+	}
+}
+
 func TestFetchErrNoIcon(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
@@ -435,36 +458,45 @@ func TestFetchIconSniffedByMagic(t *testing.T) {
 func TestAcceptIcon(t *testing.T) {
 	webp := []byte("RIFF\x04\x00\x00\x00WEBP")
 	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xE0}
+	bmp := []byte("BM\x36\x00\x00\x00")
+	cur := []byte{0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x10, 0x10}
+	svg := []byte(`<svg xmlns="http://www.w3.org/2000/svg"/>`)
 	cases := []struct {
 		name string
 		data []byte
-		ct   string
 		want string // "" = rejected
 	}{
-		{"declared image wins", []byte("anything"), "image/png; charset=x", "image/png"},
-		{"ico magic octet-stream", icoBytes, "application/octet-stream", "image/x-icon"},
-		{"ico magic binary", icoBytes, "binary/octet-stream", "image/x-icon"},
-		{"png magic missing type", png1x1, "", "image/png"},
-		{"gif magic", []byte("GIF89a..."), "application/octet-stream", "image/gif"},
-		{"jpeg magic", jpeg, "application/octet-stream", "image/jpeg"},
-		{"webp magic", webp, "application/octet-stream", "image/webp"},
-		{"declared html rejected", []byte(`<svg xmlns="http://www.w3.org/2000/svg"/>`), "text/html", ""},
-		{"declared xhtml rejected", []byte(`<svg xmlns="http://www.w3.org/2000/svg"/>`), "application/xhtml+xml", ""},
-		{"sniffed html rejected", []byte(`<!doctype html><svg`), "", ""},
-		{"svg probe", []byte(`<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"/>`), "text/xml", "image/svg+xml"},
-		{"garbage", []byte("this is not an image"), "text/plain", ""},
-		{"empty body", nil, "image/png", ""},
+		{"ico magic", icoBytes, "image/x-icon"},
+		{"cur magic", cur, "image/x-icon"},
+		{"png magic", png1x1, "image/png"},
+		{"gif magic", []byte("GIF89a..."), "image/gif"},
+		{"jpeg magic", jpeg, "image/jpeg"},
+		{"webp magic", webp, "image/webp"},
+		{"bmp magic", bmp, "image/bmp"},
+		{"svg", svg, "image/svg+xml"},
+		{"svg with prolog", []byte(`<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"/>`), "image/svg+xml"},
+		{"svg with prolog and comment", []byte(`<?xml version="1.0"?><!-- c --><svg xmlns="http://www.w3.org/2000/svg"/>`), "image/svg+xml"},
+		{"svg beyond window", []byte(`<!DOCTYPE svg ` + strings.Repeat("x", 2048) + `><svg`), ""},
+		{"html doctype", []byte(`<!DOCTYPE html><html><body><svg`), ""},
+		{"html doctype lowercase", []byte(`<!doctype html><svg`), ""},
+		{"html element", []byte(`<html><head><svg`), ""},
+		{"html after prolog", []byte(`<?xml version="1.0"?><html><svg`), ""},
+		{"unterminated prolog", []byte(`<?xml version="1.0" <svg`), ""},
+		{"unterminated comment", []byte(`<!-- <svg`), ""},
+		{"text", []byte("this is not an image"), ""},
+		{"json", []byte(`{"a":1}`), ""},
+		{"empty body", nil, ""},
 	}
 	for _, c := range cases {
-		got, ok := acceptIcon(c.data, c.ct)
+		got, ok := acceptIcon(c.data)
 		if c.want == "" {
 			if ok {
-				t.Errorf("%s: acceptIcon(%q) = %q, want reject", c.name, c.ct, got)
+				t.Errorf("%s: acceptIcon() = %q, want reject", c.name, got)
 			}
 			continue
 		}
 		if !ok || got != c.want {
-			t.Errorf("%s: acceptIcon(%q) = %q,%v, want %q", c.name, c.ct, got, ok, c.want)
+			t.Errorf("%s: acceptIcon() = %q,%v, want %q", c.name, got, ok, c.want)
 		}
 	}
 }

@@ -208,7 +208,7 @@ func (s *sqliteBookmarks) AppendMany(ctx context.Context, items []NewBookmark) (
 }
 
 func (s *sqliteSettings) Get(ctx context.Context) (Settings, error) {
-	out := Settings{Grid: DefaultGrid}
+	out := Settings{Grid: DefaultGrid, Spacing: DefaultSpacing}
 	rows, err := s.db.QueryContext(ctx, `SELECT key, value FROM settings`)
 	if err != nil {
 		return Settings{}, fmt.Errorf("get settings: %w", err)
@@ -227,6 +227,14 @@ func (s *sqliteSettings) Get(ctx context.Context) (Settings, error) {
 			if err := json.Unmarshal([]byte(val), &out.Grid); err != nil {
 				return Settings{}, fmt.Errorf("settings key %q: %w", key, err)
 			}
+		case "spacing":
+			// A malformed or out-of-range stored value falls back to the
+			// default rather than failing the whole read.
+			var spacing string
+			if err := json.Unmarshal([]byte(val), &spacing); err == nil &&
+				ValidateSpacing(spacing) == nil {
+				out.Spacing = spacing
+			}
 		}
 		// Unknown keys are ignored for forward compatibility.
 	}
@@ -237,16 +245,32 @@ func (s *sqliteSettings) Get(ctx context.Context) (Settings, error) {
 }
 
 func (s *sqliteSettings) Put(ctx context.Context, st Settings) error {
-	if err := st.Grid.Validate(); err != nil {
+	if err := st.Validate(); err != nil {
 		return fmt.Errorf("put settings: %w", err)
 	}
-	raw, err := json.Marshal(st.Grid)
+	grid, err := json.Marshal(st.Grid)
 	if err != nil {
 		return fmt.Errorf("put settings: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx,
-		`INSERT OR REPLACE INTO settings (key, value) VALUES ('grid', ?)`,
-		string(raw)); err != nil {
+	// Spacing is stored as a JSON string, like the grid document.
+	spacing, err := json.Marshal(st.Spacing)
+	if err != nil {
+		return fmt.Errorf("put settings: %w", err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("put settings: %w", err)
+	}
+	defer tx.Rollback()
+	for _, kv := range [][2]string{{"grid", string(grid)}, {"spacing", string(spacing)}} {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`,
+			kv[0], kv[1]); err != nil {
+			return fmt.Errorf("put settings: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("put settings: %w", err)
 	}
 	return nil
