@@ -6,10 +6,12 @@ import (
 	"homepage/internal/store"
 )
 
-// bookmarkIn is the JSON body for create and update: {title, url}.
+// bookmarkIn is the JSON body for create and update:
+// {title, url, allow_duplicate?}.
 type bookmarkIn struct {
-	Title string `json:"title"`
-	URL   string `json:"url"`
+	Title          string `json:"title"`
+	URL            string `json:"url"`
+	AllowDuplicate bool   `json:"allow_duplicate"`
 }
 
 func (s *server) listBookmarks(w http.ResponseWriter, r *http.Request) {
@@ -30,6 +32,9 @@ func (s *server) createBookmark(w http.ResponseWriter, r *http.Request) {
 	title, rawURL, aerr := validateBookmarkInput(in.Title, in.URL)
 	if aerr != nil {
 		writeErr(w, aerr)
+		return
+	}
+	if s.rejectDuplicate(w, r, rawURL, 0, in.AllowDuplicate) {
 		return
 	}
 	b, err := s.store.Create(r.Context(), title, rawURL)
@@ -63,6 +68,9 @@ func (s *server) updateBookmark(w http.ResponseWriter, r *http.Request) {
 		s.handleErr(w, r, err)
 		return
 	}
+	if s.rejectDuplicate(w, r, rawURL, id, in.AllowDuplicate) {
+		return
+	}
 	b, err := s.store.Update(r.Context(), id, title, rawURL)
 	if err != nil {
 		s.handleErr(w, r, err)
@@ -74,6 +82,33 @@ func (s *server) updateBookmark(w http.ResponseWriter, r *http.Request) {
 		s.icons.Enqueue(b.ID, b.URL)
 	}
 	writeJSON(w, http.StatusOK, b)
+}
+
+// rejectDuplicate writes a 409 naming the colliding bookmark and reports
+// true when the normalized rawURL already belongs to a stored bookmark
+// other than excludeID (0 on create) — unless the caller passed
+// allow_duplicate. Personal scale: the check scans the full list.
+func (s *server) rejectDuplicate(w http.ResponseWriter, r *http.Request, rawURL string, excludeID int64, allow bool) bool {
+	if allow {
+		return false
+	}
+	want := NormalizeURL(rawURL)
+	bs, err := s.store.List(r.Context())
+	if err != nil {
+		s.handleErr(w, r, err)
+		return true
+	}
+	for _, b := range bs {
+		if b.ID != excludeID && NormalizeURL(b.URL) == want {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":       "bookmark with this URL already exists",
+				"code":        codeDuplicateURL,
+				"existing_id": b.ID,
+			})
+			return true
+		}
+	}
+	return false
 }
 
 func (s *server) deleteBookmark(w http.ResponseWriter, r *http.Request) {

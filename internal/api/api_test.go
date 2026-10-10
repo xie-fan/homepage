@@ -145,11 +145,13 @@ func decodeResp(t *testing.T, resp *http.Response, out any) int {
 	return resp.StatusCode
 }
 
-// errBody decodes the API error envelope {"error","code","field"?}.
+// errBody decodes the API error envelope {"error","code","field"?} plus
+// the "existing_id" carried by duplicate_url conflicts.
 type errBody struct {
-	Error string `json:"error"`
-	Code  string `json:"code"`
-	Field string `json:"field"`
+	Error      string `json:"error"`
+	Code       string `json:"code"`
+	Field      string `json:"field"`
+	ExistingID int64  `json:"existing_id"`
 }
 
 func readAll(t *testing.T, resp *http.Response) []byte {
@@ -760,5 +762,161 @@ func TestUnknownAPIPath(t *testing.T) {
 	}
 	if e.Code != codeMethodNotAllowed {
 		t.Errorf("POST /: code %q, want %q", e.Code, codeMethodNotAllowed)
+	}
+}
+
+// TestDuplicateCreate: POST /api/bookmarks rejects a URL that matches an
+// existing bookmark after normalization, unless allow_duplicate is set.
+func TestDuplicateCreate(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	a := postBookmark(t, srv, "a", "https://a.example.com")
+
+	// Exact repeat → 409 naming the existing bookmark.
+	var e errBody
+	code := reqJSON(t, srv, http.MethodPost, "/api/bookmarks",
+		map[string]string{"title": "dup", "url": "https://a.example.com"}, &e)
+	if code != http.StatusConflict {
+		t.Fatalf("dup create = %d, want 409", code)
+	}
+	if e.Code != codeDuplicateURL || e.ExistingID != a.ID {
+		t.Fatalf("dup body = %+v, want code %q existing_id %d", e, codeDuplicateURL, a.ID)
+	}
+	if e.Error != "bookmark with this URL already exists" {
+		t.Fatalf("dup error = %q", e.Error)
+	}
+
+	// Normalized-equal spellings — case, default port, empty-vs-"/" path,
+	// fragment — collide too.
+	for _, u := range []string{
+		"https://A.example.com",
+		"https://a.example.com/",
+		"https://a.example.com:443",
+		"https://a.example.com#frag",
+		"HTTPS://A.Example.COM:443/#frag",
+	} {
+		e = errBody{}
+		code = reqJSON(t, srv, http.MethodPost, "/api/bookmarks",
+			map[string]string{"title": "dup", "url": u}, &e)
+		if code != http.StatusConflict || e.Code != codeDuplicateURL || e.ExistingID != a.ID {
+			t.Errorf("POST %s = %d %+v, want 409 duplicate_url existing_id=%d",
+				u, code, e, a.ID)
+		}
+	}
+	if got := listTitles(t, srv); !slices.Equal(got, []string{"a"}) {
+		t.Fatalf("rejected creates persisted: %v", got)
+	}
+
+	// allow_duplicate forces the create despite the collision.
+	var b store.Bookmark
+	code = reqJSON(t, srv, http.MethodPost, "/api/bookmarks",
+		map[string]any{"title": "dup-ok", "url": "https://a.example.com/",
+			"allow_duplicate": true}, &b)
+	if code != http.StatusCreated || b.URL != "https://a.example.com/" {
+		t.Fatalf("allow_duplicate create = %d %+v, want 201", code, b)
+	}
+
+	// A genuinely different URL still works.
+	postBookmark(t, srv, "b", "https://b.example.com/path?q=1")
+}
+
+// TestDuplicateUpdate: PUT /api/bookmarks/{id} rejects a URL matching
+// another bookmark after normalization; the bookmark's own URL is fine.
+func TestDuplicateUpdate(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	a := postBookmark(t, srv, "a", "https://a.example.com")
+	b := postBookmark(t, srv, "b", "https://b.example.com/page?q=1")
+
+	// Keeping the same URL — even respelled — is not a duplicate.
+	var up store.Bookmark
+	for _, u := range []string{"https://a.example.com", "HTTPS://A.example.COM/#x"} {
+		up = store.Bookmark{}
+		code := reqJSON(t, srv, http.MethodPut, fmt.Sprintf("/api/bookmarks/%d", a.ID),
+			map[string]string{"title": "a2", "url": u}, &up)
+		if code != http.StatusOK {
+			t.Fatalf("keep-own-url PUT %s = %d, want 200", u, code)
+		}
+	}
+
+	// Changing to another bookmark's URL (exact or normalized-equal)
+	// → 409 naming that bookmark.
+	for _, u := range []string{
+		"https://b.example.com/page?q=1",
+		"https://B.example.com:443/page?q=1#frag",
+	} {
+		var e errBody
+		code := reqJSON(t, srv, http.MethodPut, fmt.Sprintf("/api/bookmarks/%d", a.ID),
+			map[string]string{"title": "a", "url": u}, &e)
+		if code != http.StatusConflict || e.Code != codeDuplicateURL || e.ExistingID != b.ID {
+			t.Errorf("PUT %s = %d %+v, want 409 duplicate_url existing_id=%d",
+				u, code, e, b.ID)
+		}
+	}
+	// Rejected updates persisted nothing.
+	if got := listTitles(t, srv); !slices.Equal(got, []string{"a2", "b"}) {
+		t.Fatalf("list after rejected updates = %v", got)
+	}
+
+	// allow_duplicate permits the change.
+	code := reqJSON(t, srv, http.MethodPut, fmt.Sprintf("/api/bookmarks/%d", a.ID),
+		map[string]any{"title": "a", "url": "https://b.example.com/page?q=1",
+			"allow_duplicate": true}, &up)
+	if code != http.StatusOK || up.URL != "https://b.example.com/page?q=1" {
+		t.Fatalf("allow_duplicate update = %d %+v, want 200", code, up)
+	}
+
+	// A missing bookmark is still a 404, not a 409.
+	if code := reqJSON(t, srv, http.MethodPut, "/api/bookmarks/999",
+		map[string]string{"title": "x", "url": b.URL}, nil); code != http.StatusNotFound {
+		t.Fatalf("missing bookmark update = %d, want 404", code)
+	}
+}
+
+// TestImportAllowsDuplicates: the import path is exempt from duplicate
+// detection.
+func TestImportAllowsDuplicates(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	postBookmark(t, srv, "a", "https://a.example.com")
+
+	var res map[string]int
+	code := reqRaw(t, srv, http.MethodPost, "/api/import",
+		`[{"title":"dup","url":"https://A.example.com/"}]`, &res)
+	if code != http.StatusOK || res["imported"] != 1 {
+		t.Fatalf("import = %d %v, want 200 imported=1", code, res)
+	}
+	if got := listTitles(t, srv); !slices.Equal(got, []string{"a", "dup"}) {
+		t.Fatalf("list = %v", got)
+	}
+}
+
+// TestFavicon: GET /favicon.ico serves the embedded app icon SVG
+// day-cached; the file is also reachable at its real name.
+func TestFavicon(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+
+	resp := do(t, srv, http.MethodGet, "/favicon.ico", nil)
+	raw := readAll(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /favicon.ico: status %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/svg+xml" {
+		t.Errorf("GET /favicon.ico: Content-Type = %q, want image/svg+xml", ct)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "public, max-age=86400" {
+		t.Errorf("GET /favicon.ico: Cache-Control = %q, want public, max-age=86400", cc)
+	}
+	if !strings.Contains(string(raw), "<svg") {
+		t.Error("GET /favicon.ico: body is not an SVG")
+	}
+
+	resp = do(t, srv, http.MethodGet, "/favicon.svg", nil)
+	raw = readAll(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /favicon.svg: status %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/svg+xml" {
+		t.Errorf("GET /favicon.svg: Content-Type = %q, want image/svg+xml", ct)
+	}
+	if !strings.Contains(string(raw), "<svg") {
+		t.Error("GET /favicon.svg: body is not an SVG")
 	}
 }

@@ -35,10 +35,11 @@ type Deps struct {
 
 // server is the unexported handler implementation behind NewServer.
 type server struct {
-	store  *store.Store
-	icons  IconService
-	logger *slog.Logger
-	static http.Handler // file server for the embedded UI
+	store    *store.Store
+	icons    IconService
+	logger   *slog.Logger
+	static   http.Handler // file server for the embedded UI
+	staticFS fs.FS        // the same files, for direct reads (favicon)
 	// apiPaths mirrors the API routes without methods so unknownAPI can
 	// tell a wrong-method call (405) from an unknown path (404);
 	// apiMethods lists the registered methods per path pattern.
@@ -84,6 +85,10 @@ func NewServer(deps Deps) http.Handler {
 	route("GET /api/export", s.exportBookmarks)
 	route("POST /api/import", s.importBookmarks)
 
+	// Browsers request /favicon.ico unconditionally; answer with the app
+	// icon SVG (also reachable as /favicon.svg via the file server).
+	mux.HandleFunc("GET /favicon.ico", s.serveFavicon)
+
 	// Unmatched /api paths (any method) get a JSON 404 instead of the file
 	// server's plain-text one. More specific API patterns win over these.
 	mux.HandleFunc("/api", s.unknownAPI)
@@ -94,6 +99,7 @@ func NewServer(deps Deps) http.Handler {
 		static = web.Static()
 	}
 	s.static = http.FileServer(http.FS(static))
+	s.staticFS = static
 	// The bare "/" pattern also covers /api/* paths, but the more specific
 	// API and /api catch-all patterns win for those.
 	mux.HandleFunc("/", s.serveStatic)
@@ -125,6 +131,19 @@ func (s *server) serveStatic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.static.ServeHTTP(w, r)
+}
+
+// serveFavicon answers GET /favicon.ico with the app icon SVG, day-cached.
+func (s *server) serveFavicon(w http.ResponseWriter, r *http.Request) {
+	data, err := fs.ReadFile(s.staticFS, "favicon.svg")
+	if err != nil {
+		s.handleErr(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", iconCacheControl)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 func (s *server) health(w http.ResponseWriter, _ *http.Request) {

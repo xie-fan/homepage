@@ -54,3 +54,35 @@ func validateBookmarkInput(title, rawURL string) (string, string, *apiError) {
 	}
 	return title, u, nil
 }
+
+// NormalizeURL reduces a URL to the canonical form used for duplicate
+// detection: scheme and host lowercased, the scheme's default port
+// dropped (80 for http, 443 for https), an empty path treated as "/",
+// and the fragment removed. Path, query and non-default ports are kept
+// as-is, so e.g. case differences in the path still distinguish URLs.
+// Returns "" when rawURL cannot be parsed.
+func NormalizeURL(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return ""
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	host := strings.ToLower(parsed.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]" // re-bracket an IPv6 literal
+	}
+	if port := parsed.Port(); port != "" && !defaultPort(parsed.Scheme, port) {
+		host += ":" + port
+	}
+	parsed.Host = host
+	parsed.Fragment = ""
+	if parsed.Path == "" {
+		parsed.Path = "/"
+	}
+	return parsed.String()
+}
+
+// defaultPort reports whether port is the implied port for scheme.
+func defaultPort(scheme, port string) bool {
+	return scheme == "http" && port == "80" || scheme == "https" && port == "443"
+}

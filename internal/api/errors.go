@@ -14,6 +14,7 @@ const (
 	codeURLTooLong       = "url_too_long"
 	codeURLUserinfo      = "url_userinfo"
 	codeTitleTooLong     = "title_too_long"
+	codeDuplicateURL     = "duplicate_url"
 	codeNotFound         = "not_found"
 	codeInvalidID        = "invalid_id"
 	codeInvalidOrder     = "invalid_order"
