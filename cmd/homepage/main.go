@@ -16,6 +16,7 @@ import (
 	"homepage/internal/api"
 	"homepage/internal/config"
 	"homepage/internal/db"
+	"homepage/internal/store"
 )
 
 // shutdownTimeout bounds graceful shutdown on SIGINT/SIGTERM.
@@ -55,8 +56,13 @@ func run() error {
 	}
 
 	srv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           api.NewServer(),
+		Addr: cfg.Addr,
+		// NopIcons stands in until the favicon worker lands (Task 5).
+		Handler: api.NewServer(api.Deps{
+			Store:  store.NewSQLite(sqlDB),
+			Icons:  api.NopIcons{},
+			Logger: slog.Default(),
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
