@@ -15,24 +15,35 @@
   /* Grid metrics — layout() in app.js writes these as resolved px on
      :root (dnd.js parses --tile-w/--tile-h); the values here are the
      desktop fallbacks before JS runs.
-     Sizing formula:
-       tileW = min(96px, (vw − 2·padX − (cols−1)·gap) / cols,
-                        (vh − 2·padY − (rows−1)·gap) / rows · 96/106)
-       tileH = tileW · 106/96        (desktop tile 96×106 keeps its aspect)
-       gap   = clamp(8px, 0.15·tileW, 14px)
-       padX  = 64px while the side arrows overlay the grid (≥768px and
-               more than one page), 12px otherwise; padY = 12px.
-     Icon, label, edit badge and link gap all derive from --tile-w via
-     clamp(), so the configured grid (rows 3–5 × cols 4–6) always fits
-     the viewport instead of forcing a fixed tile size. */
-  --tile-w: 96px;
-  --tile-h: 106px;
-  --grid-gap: 14px;
+     Sizing formula (per spacing preset: frac = target share of the
+     viewport width, gapShare = share of that target spent on column
+     gaps, gapMin/gapMax = gap range, tileMax = tile width cap,
+     rowMul = row-gap multiplier):
+       availW = vw − 2·padX      availH = vh − 2·padY
+       F      = min(availW, lerp(0.94 → frac) · vw)   target grid width
+                (the share eases toward near-full width below 1024px)
+       gapX   = clamp(gapMin, F·gapShare/(cols−1), gapMax)
+       gapY   = gapX · rowMul
+       tileW  = min(tileMax,
+                    (F      − (cols−1)·gapX) / cols,  fill the target
+                    (availW − (cols−1)·gapX) / cols,  never overflow
+                    rowFit / 0.92 and icon+label fit) height bound
+       tileH  = clamp(aspect·tileW, icon + label block, rowFit)
+       rowFit = (availH − (rows−1)·gapY) / rows
+       padX   = 64px while the side arrows overlay the grid (≥768px and
+                more than one page), 12px otherwise; padY = 12px.
+     Gaps shrink to gapMin before tiles give way, so the configured grid
+     (rows 3–5 × cols 4–6) always fits the viewport. Icon, label, edit
+     badge and link gap derive from --tile-w via clamp(). */
+  --tile-w: 106px;
+  --tile-h: 98px;
+  --grid-gap-x: 32px;
+  --grid-gap-y: 32px;
   --page-pad-x: 64px;
   --page-pad-y: 12px;
-  --icon: clamp(36px, calc(var(--tile-w) * 0.7), 64px);
-  --title-fs: clamp(11px, calc(var(--tile-w) * 0.135), 13px);
-  --edit-sz: clamp(20px, calc(var(--tile-w) * 0.25), 24px);
+  --icon: clamp(36px, calc(var(--tile-w) * 0.62), 72px);
+  --title-fs: clamp(12px, calc(var(--tile-w) * 0.125), 14px);
+  --edit-sz: clamp(20px, calc(var(--tile-w) * 0.24), 26px);
   --radius: 14px;
   --shadow: 0 4px 16px rgba(30, 41, 59, 0.1);
 }
@@ -169,7 +180,7 @@ body {
   --rows: 4;
   grid-template-columns: repeat(var(--cols), var(--tile-w));
   grid-template-rows: repeat(var(--rows), var(--tile-h));
-  gap: var(--grid-gap);
+  gap: var(--grid-gap-y) var(--grid-gap-x);
   padding: var(--page-pad-y) var(--page-pad-x);
 }
 
@@ -201,7 +212,7 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: clamp(3px, calc(var(--tile-w) * 0.083), 8px);
+  gap: clamp(4px, calc(var(--tile-w) * 0.08), 10px);
   height: 100%;
   padding-top: 2px;
   text-decoration: none;

@@ -57,7 +57,9 @@ export const api = {
   reorder: (ids) => request('/api/bookmarks/order', { method: 'PUT', body: { ids } }),
   refreshIcon: (id) => request(`/api/bookmarks/${id}/icon/refresh`, { method: 'POST' }),
   getSettings: () => request('/api/settings'),
-  putSettings: (grid) => request('/api/settings', { method: 'PUT', body: { grid } }),
+  // patch is a partial settings document, e.g. {grid:{rows,cols}} or
+  // {spacing:'relaxed'} — the server merges it into the stored settings.
+  putSettings: (patch) => request('/api/settings', { method: 'PUT', body: patch }),
   // doc is the export-shaped object (or bare array); mode is 'append' | 'replace'.
   importBookmarks: (doc, mode) =>
     request(`/api/import?mode=${encodeURIComponent(mode)}`, { method: 'POST', body: doc }),

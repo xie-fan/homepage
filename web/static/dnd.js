@@ -150,21 +150,23 @@ function updateTarget(x, y) {
 function cellIndexAt(pageEl, x, y) {
   const { rows, cols } = state.grid;
   const root = getComputedStyle(document.documentElement);
-  const tileW = parseFloat(root.getPropertyValue('--tile-w')) || 96;
-  const tileH = parseFloat(root.getPropertyValue('--tile-h')) || 106;
+  const tileW = parseFloat(root.getPropertyValue('--tile-w')) || 106;
+  const tileH = parseFloat(root.getPropertyValue('--tile-h')) || 98;
   const ps = getComputedStyle(pageEl);
-  const gap = parseFloat(ps.columnGap) || 0;
+  // Column/row gaps differ when the spacing preset adds row air.
+  const gapX = parseFloat(ps.columnGap) || 0;
+  const gapY = parseFloat(ps.rowGap) || 0;
   const padL = parseFloat(ps.paddingLeft) || 0;
   const padR = parseFloat(ps.paddingRight) || 0;
   const padT = parseFloat(ps.paddingTop) || 0;
   const padB = parseFloat(ps.paddingBottom) || 0;
   const r = pageEl.getBoundingClientRect();
-  const gridW = cols * tileW + (cols - 1) * gap;
-  const gridH = rows * tileH + (rows - 1) * gap;
+  const gridW = cols * tileW + (cols - 1) * gapX;
+  const gridH = rows * tileH + (rows - 1) * gapY;
   const ox = r.left + padL + (r.width - padL - padR - gridW) / 2;
   const oy = r.top + padT + (r.height - padT - padB - gridH) / 2;
-  return cellCoord(y, oy, tileH, gap, rows) * cols +
-    cellCoord(x, ox, tileW, gap, cols);
+  return cellCoord(y, oy, tileH, gapY, rows) * cols +
+    cellCoord(x, ox, tileW, gapX, cols);
 }
 
 // cellCoord converts one axis into a cell number. Each repeat unit is

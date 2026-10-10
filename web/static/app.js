@@ -9,10 +9,16 @@ import { api } from './api.js';
 const state = {
   bookmarks: [],
   grid: { rows: 4, cols: 6 },
+  spacing: 'normal', // one of SPACING_VALUES; drives the layout preset
   page: 0,
   editing: null, // bookmark in the modal; null while adding
   loadError: null,
 };
+
+// spacingOf validates a settings.spacing value from the server (or an
+// import file); anything unknown or absent falls back to "normal".
+const SPACING_VALUES = ['compact', 'normal', 'relaxed'];
+const spacingOf = (v) => (SPACING_VALUES.includes(v) ? v : 'normal');
 
 // Wheel: accumulate deltas so both wheel mice and trackpads work; a
 // threshold + cooldown makes one gesture flip exactly one page.
@@ -48,6 +54,7 @@ const ERROR_MESSAGES = {
   title_too_long: '名称太长（最多 200 个字符）',
   duplicate_url: '该网址已存在',
   invalid_grid: '网格设置无效',
+  invalid_spacing: '间距设置无效',
   import_invalid: '导入文件格式不正确',
   import_too_large: '导入的书签太多（最多 5000 个）',
   not_found: '书签不存在，可能已被删除',
@@ -93,17 +100,51 @@ const clampPage = () => {
 
 // ---------- layout ----------
 //
-// The grid keeps the configured rows/cols on every viewport: the tile is
-// shrunk until the whole grid fits, never grown past the 96×106 desktop
-// tile. layout() measures the real .viewport box and writes the resolved
-// metrics (--tile-w/--tile-h/--grid-gap/--page-pad-*) as px on :root —
-// style.css derives icon/label/edit sizes from --tile-w via clamp(), and
-// dnd.js parses --tile-* back into numbers. The formula is documented
-// next to the fallbacks in style.css (:root).
-const TILE_DESKTOP_W = 96;
-const TILE_DESKTOP_H = 106;
+// The grid keeps the configured rows/cols on every viewport. Each
+// spacing preset (state.spacing) contributes: frac — the share of the
+// viewport WIDTH the grid aims for on large screens (below 1024px it
+// eases toward a near-full-width grid so phones still use their
+// width); gapShare — the share of that target spent on the (cols−1)
+// column gaps; gapMin/gapMax — the gap range; tileMax — the tile width
+// cap; rowMul — row-gap multiplier (relaxed adds extra air between
+// rows). layout() measures the real .viewport box and writes resolved
+// metrics (--tile-w/--tile-h/--grid-gap-x/--grid-gap-y/--page-pad-*) as
+// px on :root — style.css derives icon/label/edit sizes from --tile-w
+// via clamp() (--icon: 36px…0.62·w…72px, label ~13–14px on desktop) and
+// dnd.js parses --tile-* back into numbers. The formula (also in the
+// :root comment in style.css):
+//
+//   availW = vw − 2·padX      availH = vh − 2·padY
+//   F      = min(availW, lerp(0.94 → preset.frac) · vw)  target width
+//   gapX   = clamp(gapMin, F·gapShare/(cols−1), gapMax)
+//   gapY   = gapX · rowMul
+//   tileW  = min(tileMax, (F − (cols−1)·gapX)/cols,
+//                        (availW − (cols−1)·gapX)/cols, height bound)
+//   tileH  = clamp(aspect·tileW, icon + label block, rowFit)
+//
+// Gaps shrink to gapMin before tiles give way ("gaps first, icons
+// second"), so every grid 3×4…5×6 fits without clipping or scrolling.
+// padX reserves 64px a side while the ≥768px arrows overlay the grid so
+// a tile can never slide under an arrow; padY = 12px.
+const TILE_ASPECT = 0.92; // tileH/tileW while icon + label fit inside
+const TILE_LABEL = 31;    // link pad-top + gap + one label line (~2+10+19)
+const ICON_MIN = 36;      // mirrors the --icon clamp in style.css
+const ICON_MAX = 72;
+const ICON_RATIO = 0.62;
+const SPACING = {
+  //           frac  gapShare  gapMin  gapMax  tileMax  rowMul
+  compact:  { frac: 0.43, gapShare: 0.155, gapMin: 10, gapMax: 24, tileMax: 96,  rowMul: 1.0 },
+  normal:   { frac: 0.62, gapShare: 0.200, gapMin: 12, gapMax: 40, tileMax: 106, rowMul: 1.0 },
+  relaxed:  { frac: 0.76, gapShare: 0.226, gapMin: 14, gapMax: 52, tileMax: 126, rowMul: 1.3 },
+};
+const iconFor = (t) => Math.min(ICON_MAX, Math.max(ICON_MIN, t * ICON_RATIO));
+// Least tileH for a tile of width t: the aspect box, or the icon with
+// one label line under it — whichever is taller.
+const minTileH = (t) => Math.max(t * TILE_ASPECT, iconFor(t) + TILE_LABEL);
+
 function layout() {
   const { rows, cols } = state.grid;
+  const p = SPACING[state.spacing] || SPACING.normal;
   const vw = els.viewport.clientWidth;
   const vh = els.viewport.clientHeight;
   // Side arrows overlay the page gutters at ≥768px (the .nav-arrow media
@@ -114,28 +155,39 @@ function layout() {
     displayPageCount() > 1;
   const padX = overlay ? 64 : 12;
   const padY = 12;
-  // Gap scales with the tile (8–14px). Bound the tile with the max gap
-  // first, pick the gap, then re-fit — one pass converges.
-  const fit = (gap) => Math.min(
-    TILE_DESKTOP_W,
-    (vw - 2 * padX - (cols - 1) * gap) / cols,
-    ((vh - 2 * padY - (rows - 1) * gap) / rows) * (TILE_DESKTOP_W / TILE_DESKTOP_H),
-  );
-  const gap = Math.round(Math.min(14, Math.max(8, fit(14) * 0.15)));
-  const tile = Math.max(1, Math.floor(fit(gap)));
-  // Tile height follows the desktop 96:106 aspect, grown a little when
-  // the floor-clamped icon (36px) plus label would not fit the aspect,
-  // and always capped at the per-row allotment so the grid can never
-  // overflow vertically. The +22 approximates padding + link gap + the
-  // 11px label line (mirrors --icon: clamp(36, .7·w, 64) in style.css).
-  const rowFit = Math.floor((vh - 2 * padY - (rows - 1) * gap) / rows);
-  const icon = Math.min(64, Math.max(36, tile * 0.7));
-  const tileH = Math.max(1, Math.min(rowFit,
-    Math.max(Math.floor(tile * (TILE_DESKTOP_H / TILE_DESKTOP_W)), Math.ceil(icon) + 22)));
+  const availW = vw - 2 * padX;
+  const availH = vh - 2 * padY;
+  // Target grid width: the preset share of the viewport on large
+  // screens, easing to near-full width below 1024px (t: 0 at ≤480px).
+  const t = Math.min(1, Math.max(0, (vw - 480) / (1024 - 480)));
+  const targetW = Math.min(availW, (p.frac * t + 0.94 * (1 - t)) * vw);
+  const spans = Math.max(cols - 1, 1);
+  const gapX = Math.round(Math.min(p.gapMax,
+    Math.max(p.gapMin, (targetW * p.gapShare) / spans)));
+  const gapY = Math.round(gapX * p.rowMul);
+  const rowFit = Math.floor((availH - (rows - 1) * gapY) / rows);
+  // Height-bound tile width: the aspect bound, tightened until the
+  // icon+label block also fits the row allotment (once the icon reaches
+  // its 72px cap the aspect bound alone is enough; a row too small for
+  // even the 36px icon floor is pathological — the tileH cap below
+  // keeps the grid inside the viewport regardless).
+  let tileFitH = Math.floor(rowFit / TILE_ASPECT);
+  const iconRoom = rowFit - TILE_LABEL;
+  if (iconRoom >= ICON_MIN && iconRoom < ICON_MAX) {
+    tileFitH = Math.min(tileFitH, Math.floor(iconRoom / ICON_RATIO));
+  }
+  const tile = Math.max(1, Math.floor(Math.min(
+    p.tileMax,
+    (targetW - (cols - 1) * gapX) / cols,
+    (availW - (cols - 1) * gapX) / cols,
+    tileFitH,
+  )));
+  const tileH = Math.max(1, Math.min(rowFit, Math.ceil(minTileH(tile))));
   const root = document.documentElement.style;
   root.setProperty('--tile-w', `${tile}px`);
   root.setProperty('--tile-h', `${tileH}px`);
-  root.setProperty('--grid-gap', `${gap}px`);
+  root.setProperty('--grid-gap-x', `${gapX}px`);
+  root.setProperty('--grid-gap-y', `${gapY}px`);
   root.setProperty('--page-pad-x', `${padX}px`);
   root.setProperty('--page-pad-y', `${padY}px`);
 }
@@ -221,29 +273,56 @@ function iconURL(b) {
   return `/api/icons/${b.id}?v=${encodeURIComponent(v)}`;
 }
 
+// Icons are never painted until known-good: the tile renders the letter
+// avatar first and the <img> replaces it only after its load event fired
+// with a decoded (naturalWidth > 0) image — a 404 or broken file can
+// therefore never flash the browser's broken-image placeholder. A failed
+// load retries once after ~1.5s with a fresh cache-buster (the fetch
+// worker may still be writing the file or the cache may hold a stale
+// error), then is remembered in iconFailures keyed by bookmark
+// id + icon_path so re-renders and icon polling neither restart the
+// retry loop nor reflash a broken tile. The stored value is the
+// bookmark's updated_at: an edit or icon refresh bumps it and earns the
+// icon a fresh attempt.
+const iconFailures = new Map(); // `${id}|${icon_path}` → updated_at that failed
+const ICON_RETRY_MS = 1500;
+
 function makeIcon(b) {
   const box = el('div', 'tile-icon');
-  if (b.icon_status === 'ok') {
-    const img = new Image();
-    img.alt = '';
-    img.draggable = false;
-    let attempt = 0;
-    img.addEventListener('error', () => {
-      // The status flips to "ok" as soon as the fetch worker stores the
-      // file, but a load can still race the write or a stale cache — retry
-      // twice with a fresh URL before falling back to the letter avatar.
-      if (attempt < 2) {
-        attempt += 1;
-        setTimeout(() => { img.src = `${iconURL(b)}&r=${attempt}`; }, 1200);
-      } else {
-        box.replaceChildren(avatar(b));
-      }
-    });
-    img.src = iconURL(b);
-    box.append(img);
-  } else {
-    box.append(avatar(b));
-  }
+  box.append(avatar(b)); // fallback first: a broken img is never visible
+  if (b.icon_status !== 'ok') return box;
+  const key = `${b.id}|${b.icon_path}`;
+  if (iconFailures.get(key) === b.updated_at) return box;
+  iconFailures.delete(key); // new icon data — allow another attempt
+  const img = new Image();
+  img.alt = '';
+  img.draggable = false;
+  let retried = false;
+  const fail = () => {
+    if (!retried) {
+      retried = true;
+      setTimeout(() => { img.src = `${iconURL(b)}&r=1`; }, ICON_RETRY_MS);
+    } else {
+      iconFailures.set(key, b.updated_at);
+    }
+  };
+  const show = () => {
+    // A "loaded" response that decoded to nothing counts as broken.
+    if (img.naturalWidth <= 0) {
+      fail();
+      return;
+    }
+    const swap = () => box.replaceChildren(img);
+    // decode() waits out a partially decoded frame; where it is missing
+    // or rejects (e.g. some SVGs) the load event is proof enough.
+    if (img.decode) img.decode().then(swap, swap); else swap();
+  };
+  img.addEventListener('load', show);
+  img.addEventListener('error', fail);
+  img.src = iconURL(b);
+  // Memory-cache hit: the image can be complete the moment src is set —
+  // swap in sync and skip the avatar frame entirely.
+  if (img.complete && img.naturalWidth > 0) show();
   return box;
 }
 
@@ -730,9 +809,18 @@ async function onRefreshIconClick() {
 
 // ---------- settings modal ----------
 
+// applySettings stores a settings document echoed by the server (PUT,
+// import, or the GET in refresh); spacing is validated defensively so a
+// server without the field — or an odd value — falls back to "normal".
+function applySettings(saved) {
+  if (saved && saved.grid) state.grid = saved.grid;
+  state.spacing = spacingOf(saved && saved.spacing);
+}
+
 function openSettingsModal() {
   els.setRows.value = String(state.grid.rows);
   els.setCols.value = String(state.grid.cols);
+  els.setSpacing.value = state.spacing;
   els.importFile.value = '';
   hideMsg(els.setMsg);
   showModal(els.modalSettings);
@@ -741,10 +829,21 @@ function openSettingsModal() {
 async function onGridChange() {
   const grid = { rows: Number(els.setRows.value), cols: Number(els.setCols.value) };
   try {
-    const saved = await api.putSettings(grid); // server echoes the stored settings
-    state.grid = saved.grid;
+    applySettings(await api.putSettings({ grid })); // server echoes stored settings
     render(); // re-chunk pages under the new grid
   } catch (err) {
+    showMsg(els.setMsg, friendlyError(err), true);
+  }
+}
+
+// onSpacingChange saves just the spacing preset; the re-layout is
+// immediate since spacing only changes tile/gap metrics.
+async function onSpacingChange() {
+  try {
+    applySettings(await api.putSettings({ spacing: els.setSpacing.value }));
+    render();
+  } catch (err) {
+    els.setSpacing.value = state.spacing; // restore the stored value
     showMsg(els.setMsg, friendlyError(err), true);
   }
 }
@@ -773,6 +872,11 @@ function importDocError(doc) {
           !Number.isInteger(grid.cols) || grid.cols < 4 || grid.cols > 6) {
         return 'settings.grid 无效（行须为 3–5，列须为 4–6）';
       }
+    }
+    const spacing = doc.settings ? doc.settings.spacing : undefined;
+    if (spacing !== undefined && spacing !== null &&
+        !SPACING_VALUES.includes(spacing)) {
+      return 'settings.spacing 无效（须为 compact / normal / relaxed）';
     }
     items = doc.bookmarks;
   }
@@ -812,10 +916,11 @@ async function onImportClick() {
     showToast(mode === 'replace'
       ? `已替换为 ${res.imported} 个书签`
       : `已导入 ${res.imported} 个，跳过 ${res.skipped ?? 0} 个重复`);
-    await refresh(); // reloads settings too: replace may import a new grid
-    // Reflect a freshly applied grid in the still-open dialog.
+    await refresh(); // reloads settings too: replace may import grid+spacing
+    // Reflect freshly applied settings in the still-open dialog.
     els.setRows.value = String(state.grid.rows);
     els.setCols.value = String(state.grid.cols);
+    els.setSpacing.value = state.spacing;
     pollIcons();
   } catch (err) {
     showMsg(els.setMsg, friendlyError(err), true);
@@ -826,7 +931,7 @@ async function onImportClick() {
 
 async function refresh() {
   const [settings, bookmarks] = await Promise.all([api.getSettings(), api.listBookmarks()]);
-  state.grid = settings.grid;
+  applySettings(settings);
   state.bookmarks = bookmarks;
   state.loadError = null;
   render();
@@ -919,6 +1024,7 @@ function bindEvents() {
 
   els.setRows.addEventListener('change', onGridChange);
   els.setCols.addEventListener('change', onGridChange);
+  els.setSpacing.addEventListener('change', onSpacingChange);
   els.btnExport.addEventListener('click', onExportClick);
   els.btnImport.addEventListener('click', onImportClick);
   els.setClose.addEventListener('click', closeModal);
@@ -936,7 +1042,7 @@ async function init() {
     'track', 'viewport', 'dots', 'nav-prev', 'nav-next', 'btn-add', 'btn-settings',
     'modal-bookmark', 'modal-bookmark-title', 'form-bookmark', 'bm-title', 'bm-url',
     'bm-error', 'bm-delete', 'bm-refresh', 'bm-cancel', 'bm-submit',
-    'modal-settings', 'set-rows', 'set-cols', 'set-msg',
+    'modal-settings', 'set-rows', 'set-cols', 'set-spacing', 'set-msg',
     'btn-export', 'btn-import', 'import-file', 'set-close', 'toast',
   ]) {
     els[id.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = document.getElementById(id);
