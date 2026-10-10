@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"homepage/internal/api"
 	"homepage/internal/config"
+	"homepage/internal/db"
 )
 
 // shutdownTimeout bounds graceful shutdown on SIGINT/SIGTERM.
@@ -35,14 +37,28 @@ func run() error {
 		return fmt.Errorf("create data dir %q: %w", cfg.DataDir, err)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	dbPath := filepath.Join(cfg.DataDir, "homepage.db")
+	sqlDB, err := db.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("open database %q: %w", dbPath, err)
+	}
+	defer func() {
+		if err := sqlDB.Close(); err != nil {
+			slog.Warn("close database", "err", err)
+		}
+	}()
+	if err := db.Migrate(ctx, sqlDB); err != nil {
+		return fmt.Errorf("migrate database: %w", err)
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           api.NewServer(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	errCh := make(chan error, 1)
 	go func() {
