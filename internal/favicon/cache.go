@@ -9,15 +9,23 @@ import (
 	"strings"
 )
 
+// hostKey is the per-host dedupe key for a page URL: the exact
+// lowercased host name (no port, no www.-normalizing so icons stay
+// correct for genuinely different hosts). Bookmarks sharing a hostKey
+// share one icon file and at most one in-flight fetch.
+func hostKey(pageURL string) string {
+	u, err := url.Parse(pageURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
+}
+
 // iconFileName derives the cache file name for a page URL:
 // <sha256(host)[:32]>.<ext>. Host-keyed names deduplicate icons across
 // bookmarks that point at the same site.
 func iconFileName(pageURL, ext string) string {
-	host := ""
-	if u, err := url.Parse(pageURL); err == nil {
-		host = strings.ToLower(u.Hostname())
-	}
-	sum := sha256.Sum256([]byte(host))
+	sum := sha256.Sum256([]byte(hostKey(pageURL)))
 	return hex.EncodeToString(sum[:])[:32] + "." + ext
 }
 

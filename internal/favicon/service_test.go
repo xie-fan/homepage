@@ -3,14 +3,18 @@ package favicon
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -230,5 +234,255 @@ func TestServiceSkipsStaleJob(t *testing.T) {
 	}
 	if got.IconStatus != store.IconPending {
 		t.Fatalf("status = %q, want still pending", got.IconStatus)
+	}
+}
+
+// countingIconServer serves the usual "HTML page linking /i.png" icon
+// setup while counting page and icon requests separately, so tests can
+// assert how many real fetches ran.
+type countingIconServer struct {
+	srv      *httptest.Server
+	pageHits *atomic.Int32
+	iconHits *atomic.Int32
+}
+
+func newCountingIconServer(t *testing.T) *countingIconServer {
+	t.Helper()
+	c := &countingIconServer{pageHits: &atomic.Int32{}, iconHits: &atomic.Int32{}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		c.pageHits.Add(1)
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<head><link rel="icon" href="/i.png"></head>`))
+	})
+	mux.HandleFunc("/i.png", func(w http.ResponseWriter, _ *http.Request) {
+		c.iconHits.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(png1x1)
+	})
+	c.srv = httptest.NewServer(mux)
+	t.Cleanup(c.srv.Close)
+	return c
+}
+
+func TestServiceSameHostSingleFetch(t *testing.T) {
+	// Three bookmarks on one host enqueued at once coalesce into a
+	// single fetch and land on the same host-keyed file.
+	env := newTestEnv(t)
+	ctx := context.Background()
+	src := newCountingIconServer(t)
+
+	if err := env.svc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	var ids []int64
+	for i := 0; i < 3; i++ {
+		b, err := env.st.Create(ctx, "t", fmt.Sprintf("%s/p%d", src.srv.URL, i))
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		ids = append(ids, b.ID)
+		env.svc.Enqueue(b.ID, b.URL)
+	}
+	path := ""
+	for _, id := range ids {
+		b := waitStatus(t, env.st.BookmarkStore, id, store.IconOK)
+		if path == "" {
+			path = b.IconPath
+		} else if b.IconPath != path {
+			t.Fatalf("bookmark %d icon = %q, want shared file %q", id, b.IconPath, path)
+		}
+	}
+	if path == "" {
+		t.Fatal("no icon path recorded")
+	}
+	if got := src.pageHits.Load(); got != 1 {
+		t.Fatalf("page requests = %d, want 1 (fetches not coalesced)", got)
+	}
+	if got := src.iconHits.Load(); got != 1 {
+		t.Fatalf("icon requests = %d, want 1", got)
+	}
+}
+
+func TestServiceReusesCachedIcon(t *testing.T) {
+	// A second bookmark on the same host, added after the first one's
+	// fetch completed, adopts the cached file without any network.
+	env := newTestEnv(t)
+	ctx := context.Background()
+	src := newCountingIconServer(t)
+
+	if err := env.svc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	b1, err := env.st.Create(ctx, "t", src.srv.URL+"/a")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	env.svc.Enqueue(b1.ID, b1.URL)
+	b1 = waitStatus(t, env.st.BookmarkStore, b1.ID, store.IconOK)
+
+	b2, err := env.st.Create(ctx, "t", src.srv.URL+"/b")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	env.svc.Enqueue(b2.ID, b2.URL)
+	b2 = waitStatus(t, env.st.BookmarkStore, b2.ID, store.IconOK)
+
+	if b2.IconPath != b1.IconPath {
+		t.Fatalf("b2 icon = %q, want reused %q", b2.IconPath, b1.IconPath)
+	}
+	if got := src.pageHits.Load(); got != 1 {
+		t.Fatalf("page requests = %d, want 1 (sibling icon not reused)", got)
+	}
+}
+
+func TestServiceDifferentHostsSeparateIcons(t *testing.T) {
+	// "localhost" and "127.0.0.1" reach the same server but are
+	// distinct host keys: each gets its own fetch and icon file.
+	ips, err := net.LookupIP("localhost")
+	v4 := false
+	for _, ip := range ips {
+		if ip.To4() != nil && ip.IsLoopback() {
+			v4 = true
+		}
+	}
+	if err != nil || !v4 {
+		t.Skipf("localhost does not resolve to IPv4 loopback: %v", ips)
+	}
+
+	env := newTestEnv(t)
+	ctx := context.Background()
+	src := newCountingIconServer(t)
+
+	u, err := url.Parse(src.srv.URL)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	localURL := "http://localhost:" + u.Port()
+
+	if err := env.svc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	b1, err := env.st.Create(ctx, "t", src.srv.URL)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	b2, err := env.st.Create(ctx, "t", localURL)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	env.svc.Enqueue(b1.ID, b1.URL)
+	env.svc.Enqueue(b2.ID, b2.URL)
+
+	b1 = waitStatus(t, env.st.BookmarkStore, b1.ID, store.IconOK)
+	b2 = waitStatus(t, env.st.BookmarkStore, b2.ID, store.IconOK)
+	if b1.IconPath == b2.IconPath {
+		t.Fatalf("different hosts share icon file %q", b1.IconPath)
+	}
+	if got := src.pageHits.Load(); got != 2 {
+		t.Fatalf("page requests = %d, want 2", got)
+	}
+}
+
+func TestServiceStaleSiblingIconRefetches(t *testing.T) {
+	// A sibling icon older than iconReuseMaxAge is not adopted: the
+	// second bookmark refetches (and rewrites the same host-keyed
+	// file) — this is also the refresh path for aged icons.
+	env := newTestEnv(t)
+	ctx := context.Background()
+	src := newCountingIconServer(t)
+
+	if err := env.svc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	b1, err := env.st.Create(ctx, "t", src.srv.URL+"/a")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	env.svc.Enqueue(b1.ID, b1.URL)
+	b1 = waitStatus(t, env.st.BookmarkStore, b1.ID, store.IconOK)
+
+	old := time.Now().Add(-iconReuseMaxAge - time.Hour)
+	iconFile := filepath.Join(env.iconDir, b1.IconPath)
+	if err := os.Chtimes(iconFile, old, old); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	b2, err := env.st.Create(ctx, "t", src.srv.URL+"/b")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	env.svc.Enqueue(b2.ID, b2.URL)
+	b2 = waitStatus(t, env.st.BookmarkStore, b2.ID, store.IconOK)
+
+	if got := src.pageHits.Load(); got != 2 {
+		t.Fatalf("page requests = %d, want 2 (stale icon wrongly reused)", got)
+	}
+	if b2.IconPath != b1.IconPath {
+		t.Fatalf("b2 icon = %q, want host-keyed %q", b2.IconPath, b1.IconPath)
+	}
+}
+
+func TestServiceMissingSiblingFileRefetches(t *testing.T) {
+	// Reuse requires the sibling's file on disk; a status-ok row whose
+	// file vanished does not count.
+	env := newTestEnv(t)
+	ctx := context.Background()
+	src := newCountingIconServer(t)
+
+	if err := env.svc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	b1, err := env.st.Create(ctx, "t", src.srv.URL+"/a")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	env.svc.Enqueue(b1.ID, b1.URL)
+	b1 = waitStatus(t, env.st.BookmarkStore, b1.ID, store.IconOK)
+	if err := os.Remove(filepath.Join(env.iconDir, b1.IconPath)); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	b2, err := env.st.Create(ctx, "t", src.srv.URL+"/b")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	env.svc.Enqueue(b2.ID, b2.URL)
+	waitStatus(t, env.st.BookmarkStore, b2.ID, store.IconOK)
+
+	if got := src.pageHits.Load(); got != 2 {
+		t.Fatalf("page requests = %d, want 2 (missing file wrongly reused)", got)
+	}
+}
+
+func TestServiceRefreshSoleBookmarkRefetches(t *testing.T) {
+	// POST .../icon/refresh resets icon_path/status then calls the same
+	// Enqueue. With no sibling holding the host's icon there is nothing
+	// to reuse, so the refresh always hits the network again.
+	env := newTestEnv(t)
+	ctx := context.Background()
+	src := newCountingIconServer(t)
+
+	if err := env.svc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	b, err := env.st.Create(ctx, "t", src.srv.URL)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	env.svc.Enqueue(b.ID, b.URL)
+	b = waitStatus(t, env.st.BookmarkStore, b.ID, store.IconOK)
+	if got := src.pageHits.Load(); got != 1 {
+		t.Fatalf("page requests = %d, want 1", got)
+	}
+
+	// Mirror internal/api's refreshIcon handler: reset, then Enqueue.
+	if err := env.st.SetIcon(ctx, b.ID, "", store.IconPending); err != nil {
+		t.Fatalf("SetIcon: %v", err)
+	}
+	env.svc.Enqueue(b.ID, b.URL)
+	waitStatus(t, env.st.BookmarkStore, b.ID, store.IconOK)
+	if got := src.pageHits.Load(); got != 2 {
+		t.Fatalf("page requests = %d, want 2 (refresh did not refetch)", got)
 	}
 }

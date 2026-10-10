@@ -339,3 +339,163 @@ func TestFallbackURL(t *testing.T) {
 		t.Errorf("empty fallback = %q", got)
 	}
 }
+
+func TestFetchPage403StillFindsIcon(t *testing.T) {
+	// Regression for stackoverflow.com: the page itself is a bot-wall
+	// 403, but /favicon.ico 302s to a real icon. A non-2xx (or
+	// non-HTML) page must not abort the path fallbacks.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`<html><title>Attention Required</title></html>`))
+	})
+	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/Content/Img/favicon.ico?v=1", http.StatusFound)
+	})
+	serveIcon(t, mux, "/Content/Img/favicon.ico", "image/x-icon", icoBytes)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	data, ct, err := newFetcher(Options{}).Fetch(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if ct != "image/x-icon" || !bytes.Equal(data, icoBytes) {
+		t.Fatalf("got ct=%q %d bytes", ct, len(data))
+	}
+}
+
+func TestFetchAppleTouchIconPreferred(t *testing.T) {
+	// With no <link> candidates, /apple-touch-icon.png is probed before
+	// /favicon.ico and wins.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><body>x</body></html>`))
+	})
+	serveIcon(t, mux, "/apple-touch-icon.png", "image/png", png1x1)
+	serveIcon(t, mux, "/favicon.ico", "image/x-icon", icoBytes)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	data, ct, err := newFetcher(Options{}).Fetch(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if ct != "image/png" || !bytes.Equal(data, png1x1) {
+		t.Fatalf("got ct=%q, want apple-touch-icon.png", ct)
+	}
+}
+
+func TestFetchEmptyDataURISkipped(t *testing.T) {
+	// Regression for juejin.cn: the page's only icon link is an empty
+	// placeholder data URI, and /favicon.ico serves the SPA's HTML
+	// shell — containing an inline <svg> that must NOT be adopted.
+	// Clean outcome: ErrNoIcon.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<head><link rel="icon" href="data:;base64,="></head>`))
+	})
+	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html><html><body><svg xmlns="http://www.w3.org/2000/svg"></svg></body></html>`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	_, _, err := newFetcher(Options{}).Fetch(context.Background(), srv.URL)
+	if !errors.Is(err, ErrNoIcon) {
+		t.Fatalf("err = %v, want ErrNoIcon", err)
+	}
+}
+
+func TestFetchIconSniffedByMagic(t *testing.T) {
+	// A favicon served as generic application/octet-stream is accepted
+	// by sniffing the bytes — DetectContentType has no ICO signature.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<head><link rel="icon" href="/i.ico"></head>`))
+	})
+	serveIcon(t, mux, "/i.ico", "application/octet-stream", icoBytes)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	data, ct, err := newFetcher(Options{}).Fetch(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if ct != "image/x-icon" || !bytes.Equal(data, icoBytes) {
+		t.Fatalf("got ct=%q %d bytes", ct, len(data))
+	}
+}
+
+func TestAcceptIcon(t *testing.T) {
+	webp := []byte("RIFF\x04\x00\x00\x00WEBP")
+	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xE0}
+	cases := []struct {
+		name string
+		data []byte
+		ct   string
+		want string // "" = rejected
+	}{
+		{"declared image wins", []byte("anything"), "image/png; charset=x", "image/png"},
+		{"ico magic octet-stream", icoBytes, "application/octet-stream", "image/x-icon"},
+		{"ico magic binary", icoBytes, "binary/octet-stream", "image/x-icon"},
+		{"png magic missing type", png1x1, "", "image/png"},
+		{"gif magic", []byte("GIF89a..."), "application/octet-stream", "image/gif"},
+		{"jpeg magic", jpeg, "application/octet-stream", "image/jpeg"},
+		{"webp magic", webp, "application/octet-stream", "image/webp"},
+		{"declared html rejected", []byte(`<svg xmlns="http://www.w3.org/2000/svg"/>`), "text/html", ""},
+		{"declared xhtml rejected", []byte(`<svg xmlns="http://www.w3.org/2000/svg"/>`), "application/xhtml+xml", ""},
+		{"sniffed html rejected", []byte(`<!doctype html><svg`), "", ""},
+		{"svg probe", []byte(`<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"/>`), "text/xml", "image/svg+xml"},
+		{"garbage", []byte("this is not an image"), "text/plain", ""},
+		{"empty body", nil, "image/png", ""},
+	}
+	for _, c := range cases {
+		got, ok := acceptIcon(c.data, c.ct)
+		if c.want == "" {
+			if ok {
+				t.Errorf("%s: acceptIcon(%q) = %q, want reject", c.name, c.ct, got)
+			}
+			continue
+		}
+		if !ok || got != c.want {
+			t.Errorf("%s: acceptIcon(%q) = %q,%v, want %q", c.name, c.ct, got, ok, c.want)
+		}
+	}
+}
+
+func TestFetchTotalDeadline(t *testing.T) {
+	// Every handler stalls 150ms; per-request timeout is 200ms so a
+	// single request always fits. Without a total budget the page plus
+	// three candidates plus two path fallbacks would take ~900ms;
+	// the 3x-timeout budget (600ms) must cut the whole Fetch short.
+	mux := http.NewServeMux()
+	stall := func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(150 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<head>
+			<link rel="icon" href="/a.png">
+			<link rel="icon" href="/b.png">
+			<link rel="icon" href="/c.png">
+		</head>`))
+	}
+	mux.HandleFunc("/", stall)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f := newFetcher(Options{Timeout: 200 * time.Millisecond})
+	start := time.Now()
+	_, _, err := f.Fetch(context.Background(), srv.URL)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Fetch succeeded, want deadline failure")
+	}
+	if elapsed > 850*time.Millisecond {
+		t.Fatalf("Fetch took %v, want ≤ ~3x200ms budget", elapsed)
+	}
+}

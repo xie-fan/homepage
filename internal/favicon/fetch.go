@@ -111,9 +111,10 @@ func (f *Fetcher) Close() {
 
 // Fetch finds and downloads the icon for pageURL, returning the icon
 // bytes and a normalized content type. Order: <link> candidates parsed
-// from the page, then <scheme>://<host>/favicon.ico, then the configured
-// third-party fallback. ErrNoIcon means the site simply has no usable
-// icon; any other error is a transport/guard failure worth reporting.
+// from the page, then <scheme>://<host>/apple-touch-icon.png and
+// /favicon.ico, then the configured third-party fallback. ErrNoIcon
+// means the site simply has no usable icon; any other error is a
+// transport/guard failure worth reporting.
 func (f *Fetcher) Fetch(ctx context.Context, pageURL string) (data []byte, contentType string, err error) {
 	u, err := url.Parse(pageURL)
 	if err != nil || u.Host == "" ||
@@ -121,11 +122,22 @@ func (f *Fetcher) Fetch(ctx context.Context, pageURL string) (data []byte, conte
 		return nil, "", fmt.Errorf("favicon: invalid page URL %q", pageURL)
 	}
 
+	// One Fetch runs several requests (page, candidates, path
+	// fallbacks, a third-party fallback), each bounded by the client
+	// timeout. A total budget of a few per-request timeouts keeps a
+	// worst-case site from stalling the worker beyond what the UI's
+	// post-add polling can pick up.
+	ctx, cancel := context.WithTimeout(ctx, 3*f.opts.Timeout)
+	defer cancel()
+
 	// The page fetch doubles as the candidate source and as the origin
-	// for the /favicon.ico fallback (post-redirect, so the host is the
-	// one that actually served the page). A transport error is kept:
-	// when everything else fails too it is a better answer than
-	// ErrNoIcon (e.g. the SSRF guard's ErrBlockedIP).
+	// for the path fallbacks (post-redirect, so the host is the one
+	// that actually served the page). A non-2xx or non-HTML page yields
+	// no candidates but never aborts the fetch — the fallbacks below
+	// still run (e.g. stackoverflow.com 403s the page yet serves a real
+	// /favicon.ico). A transport error is kept: when everything else
+	// fails too it is a better answer than ErrNoIcon (e.g. the SSRF
+	// guard's ErrBlockedIP).
 	cands, effective, fetchErr := f.pageCandidates(ctx, u)
 	if effective != nil {
 		u = effective
@@ -136,9 +148,11 @@ func (f *Fetcher) Fetch(ctx context.Context, pageURL string) (data []byte, conte
 		}
 	}
 
-	icoURL := &url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/favicon.ico"}
-	if data, ct, ok := f.getIcon(ctx, icoURL.String()); ok {
-		return data, ct, nil
+	for _, path := range []string{"/apple-touch-icon.png", "/favicon.ico"} {
+		iconURL := &url.URL{Scheme: u.Scheme, Host: u.Host, Path: path}
+		if data, ct, ok := f.getIcon(ctx, iconURL.String()); ok {
+			return data, ct, nil
+		}
 	}
 
 	if fb := f.fallbackURL(u.Hostname()); fb != "" {
@@ -246,22 +260,64 @@ func (f *Fetcher) setHeaders(req *http.Request, accept string) {
 }
 
 // acceptIcon validates a downloaded body as an icon and returns the
-// content type to store for it. The declared type wins; otherwise the
-// body is sniffed. SVG sniffs as text/xml, so a literal "<svg" in the
-// first KiB is accepted as image/svg+xml.
+// content type to store for it. The declared type wins when it is an
+// image. A declared (or sniffed) HTML type is rejected outright — a
+// page is never an icon, and checking before the SVG probe keeps
+// markup with an early inline "<svg" (e.g. an SPA shell served for
+// /favicon.ico) from being adopted. Generic types
+// (application/octet-stream, binary/octet-stream, missing) fall
+// through to byte sniffing; SVG sniffs as text, so a literal "<svg" in
+// the first KiB is accepted as image/svg+xml last.
 func acceptIcon(data []byte, headerCT string) (string, bool) {
 	if len(data) == 0 {
 		return "", false
 	}
-	if ct := mediaType(headerCT); strings.HasPrefix(ct, "image/") {
+	declared := mediaType(headerCT)
+	if strings.HasPrefix(declared, "image/") {
+		return declared, true
+	}
+	if isHTMLMediaType(declared) {
+		return "", false
+	}
+	if ct, ok := sniffImageType(data); ok {
 		return ct, true
 	}
 	sniffed := mediaType(http.DetectContentType(data))
 	if strings.HasPrefix(sniffed, "image/") {
 		return sniffed, true
 	}
+	if isHTMLMediaType(sniffed) {
+		return "", false
+	}
 	if looksLikeSVG(data) {
 		return "image/svg+xml", true
+	}
+	return "", false
+}
+
+// isHTMLMediaType reports whether mt marks an (X)HTML document.
+func isHTMLMediaType(mt string) bool {
+	return mt == "text/html" || mt == "application/xhtml+xml"
+}
+
+// sniffImageType recognizes icon encodings by magic bytes. It exists
+// because http.DetectContentType has no ICO signature — and servers
+// frequently label .ico as application/octet-stream — and to keep the
+// common types independent of DetectContentType's ordering.
+func sniffImageType(data []byte) (string, bool) {
+	switch {
+	case len(data) >= 4 && data[0] == 0x00 && data[1] == 0x00 &&
+		data[2] == 0x01 && data[3] == 0x00:
+		return "image/x-icon", true
+	case bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")):
+		return "image/png", true
+	case bytes.HasPrefix(data, []byte("GIF8")):
+		return "image/gif", true
+	case len(data) >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF:
+		return "image/jpeg", true
+	case len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) &&
+		bytes.Equal(data[8:12], []byte("WEBP")):
+		return "image/webp", true
 	}
 	return "", false
 }
