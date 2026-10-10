@@ -1,0 +1,21 @@
+services:
+  homepage:
+    build: .
+    image: homepage:local
+    ports:
+      - "${HOMEPAGE_PORT:-8080}:8080"
+    volumes:
+      # Named volume: works out of the box — Docker seeds it from the
+      # image's /data, which is already owned by uid 65532 (nonroot).
+      # For a bind mount instead, see README ("Quick start").
+      - homepage-data:/data
+    environment:
+      HOMEPAGE_FAVICON_ALLOW_PRIVATE: "${HOMEPAGE_FAVICON_ALLOW_PRIVATE:-false}"
+      HOMEPAGE_FAVICON_FALLBACK: "${HOMEPAGE_FAVICON_FALLBACK:-}"
+      HOMEPAGE_FAVICON_TIMEOUT: "${HOMEPAGE_FAVICON_TIMEOUT:-8s}"
+    restart: unless-stopped
+    # No healthcheck: the distroless image cannot exec probe commands.
+    # GET /api/health returns {"ok":true} for external monitoring.
+
+volumes:
+  homepage-data:
